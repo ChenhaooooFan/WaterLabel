@@ -1,11 +1,12 @@
 """
 NailVesta 发货系统
 - 上传 Lark 水单 CSV
-- (可选) 上传产品图册（图片）
+- 上传产品图册 CSV（提供准确的款式名/中文名/甲型/库位/图片）
+- (可选) 上传产品图片文件夹（拣货时显示）
 - 选择洛杉矶日期（默认最晚日期）
 - 生成 3 个文件：
-  1. 拣货表（按库位排序）
-  2. Packing Slip（客户发货单）
+  1. 拣货表（显示库位 + 中文名 + 英文款式 + 甲型 + 图片名）
+  2. Packing Slip（客户发货单，款式以图册为准）
   3. 买 Label 的 Excel（物流水单）
 """
 
@@ -255,6 +256,69 @@ def load_lark_data(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False)
+def load_catalog(file_bytes: bytes) -> pd.DataFrame:
+    """加载产品图册 CSV，返回以 SKU 为索引的 DataFrame"""
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    # 标准化列：保留有用字段
+    keep = ["SKU", "中文名称", "款式英文名称", "甲型", "厂家", "图片", "库位", "所属系列"]
+    keep = [c for c in keep if c in df.columns]
+    df = df[keep].copy()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    return df
+
+
+def extract_sku_short(full_sku: str) -> str:
+    """从 Full SKU 提取基础 SKU：'NMF004-M' -> 'NMF004'"""
+    if not isinstance(full_sku, str):
+        return ""
+    m = re.match(r"^(N[A-Z]{2}\d+)", full_sku.strip())
+    return m.group(1) if m else full_sku.split("-")[0].strip()
+
+
+def enrich_orders(orders: pd.DataFrame, catalog: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    用图册数据富集订单：
+    - 款式英文（图册优先，覆盖 Lark 脏数据）
+    - 中文名（仅图册有）
+    - 甲型（仅图册有）
+    - 库位（图册优先，Lark 兜底）
+    - 图片文件名（仅图册有）
+    """
+    out = orders.copy()
+    out["SKU_short"] = out["Full SKU"].apply(extract_sku_short)
+
+    if catalog is None or catalog.empty:
+        out["款式_最终"] = out["款式"].fillna("")
+        out["中文名"] = ""
+        out["甲型"] = ""
+        out["库位_最终"] = out["库位"].fillna("")
+        out["图片"] = ""
+        return out
+
+    cat_idx = catalog.set_index("SKU")
+    def lookup(sku, col):
+        if sku in cat_idx.index and col in cat_idx.columns:
+            v = cat_idx.loc[sku, col]
+            if isinstance(v, pd.Series):
+                v = v.iloc[0]
+            return "" if pd.isna(v) else str(v)
+        return ""
+
+    out["款式_最终"] = out["SKU_short"].apply(lambda s: lookup(s, "款式英文名称"))
+    out.loc[out["款式_最终"] == "", "款式_最终"] = out["款式"].fillna("")
+
+    out["中文名"] = out["SKU_short"].apply(lambda s: lookup(s, "中文名称"))
+    out["甲型"] = out["SKU_short"].apply(lambda s: lookup(s, "甲型"))
+
+    cat_loc = out["SKU_short"].apply(lambda s: lookup(s, "库位"))
+    lark_loc = out["库位"].fillna("").astype(str).replace("nan", "")
+    out["库位_最终"] = cat_loc.where(cat_loc != "", lark_loc)
+
+    out["图片"] = out["SKU_short"].apply(lambda s: lookup(s, "图片"))
+    return out
+
+
 def filter_orders_for_date(df: pd.DataFrame, target_date: str) -> pd.DataFrame:
     """筛选指定日期、有 Order ID 和 Shipping Info 的订单"""
     out = df[
@@ -272,20 +336,30 @@ def filter_orders_for_date(df: pd.DataFrame, target_date: str) -> pd.DataFrame:
 # 文件 1：拣货表（按库位排序）
 # ============================================================
 def build_picking_list(orders: pd.DataFrame, date_str: str) -> bytes:
+    """
+    orders 已被 enrich_orders 富集，含：
+      库位_最终, SKU_short, Full SKU, 中文名, 款式_最终, 甲型, Size, 图片
+    """
     rows = []
     for _, r in orders.iterrows():
         ship = parse_shipping_info(r.get("Shipping Info", ""))
+        size = r.get("Size") if pd.notna(r.get("Size")) else ""
+        # Size 可能是 "M"/"L"/"S"/"5个"等
         rows.append({
-            "库位": r.get("库位") if pd.notna(r.get("库位")) else "",
-            "Full SKU": r.get("Full SKU") if pd.notna(r.get("Full SKU")) else "",
-            "款式": r.get("款式") if pd.notna(r.get("款式")) else "",
-            "Size": r.get("Size") if pd.notna(r.get("Size")) else "",
+            "库位": r.get("库位_最终") or "",
+            "SKU": r.get("SKU_short") or "",
+            "Full SKU": r.get("Full SKU") or "",
+            "中文名": r.get("中文名") or "",
+            "英文款式": r.get("款式_最终") or "",
+            "甲型": r.get("甲型") or "",
+            "Size": size,
             "数量": 1,
+            "图片": r.get("图片") or "",
             "Order ID": r["Order ID"],
             "收件人": ship.get("name", ""),
         })
     df = pd.DataFrame(rows)
-    df = df.sort_values(by=["库位", "Full SKU"], na_position="last").reset_index(drop=True)
+    df = df.sort_values(by=["库位", "SKU"], na_position="last").reset_index(drop=True)
     df.insert(0, "拣货顺序", range(1, len(df) + 1))
     df["√"] = ""
 
@@ -298,16 +372,18 @@ def build_picking_list(orders: pd.DataFrame, date_str: str) -> bytes:
     header_fill = PatternFill("solid", start_color="305496")
     border = Border(*[Side(style="thin", color="BFBFBF")] * 4)
 
+    cols = list(df.columns)
+    n_cols = len(cols)
+
     ws["A1"] = f"NailVesta 拣货表 - {date_str}"
     ws["A1"].font = title_font
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(df.columns))
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
 
-    ws["A2"] = f"共 {len(df)} 单"
+    ws["A2"] = f"共 {len(df)} 单    （按库位排序，便于一次走完所有货架）"
     ws["A2"].font = Font(name="Arial", size=10, italic=True, color="595959")
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(df.columns))
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n_cols)
 
-    cols = list(df.columns)
     for c, h in enumerate(cols, 1):
         cell = ws.cell(row=4, column=c, value=h)
         cell.font = header_font
@@ -319,22 +395,26 @@ def build_picking_list(orders: pd.DataFrame, date_str: str) -> bytes:
         for c_idx, val in enumerate(row, 1):
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
             cell.font = Font(name="Arial", size=10)
+            col_name = cols[c_idx - 1]
             cell.alignment = Alignment(
-                horizontal="center" if cols[c_idx - 1] in ("拣货顺序", "数量", "√", "Size") else "left",
+                horizontal="center" if col_name in ("拣货顺序", "数量", "√", "Size", "甲型") else "left",
                 vertical="center",
+                wrap_text=True,
             )
             cell.border = border
-            if cols[c_idx - 1] == "库位":
+            if col_name == "库位":
                 cell.font = Font(name="Arial", size=10, bold=True, color="C00000")
+            elif col_name == "中文名":
+                cell.font = Font(name="Arial", size=10, bold=True)
 
     widths = {
-        "拣货顺序": 8, "库位": 12, "Full SKU": 14, "款式": 22, "Size": 8,
-        "数量": 7, "Order ID": 22, "收件人": 22, "√": 5,
+        "拣货顺序": 7, "库位": 11, "SKU": 9, "Full SKU": 12, "中文名": 12,
+        "英文款式": 20, "甲型": 11, "Size": 7, "数量": 6, "图片": 18,
+        "Order ID": 22, "收件人": 18, "√": 4,
     }
     for c, h in enumerate(cols, 1):
         ws.column_dimensions[get_column_letter(c)].width = widths.get(h, 12)
     ws.row_dimensions[4].height = 22
-
     ws.freeze_panes = "A5"
 
     out = io.BytesIO()
@@ -364,7 +444,11 @@ def build_packing_slip(orders: pd.DataFrame, date_str: str) -> bytes:
         ship = parse_shipping_info(r.get("Shipping Info", ""))
         order_id = r["Order ID"]
         sku = r.get("Full SKU") if pd.notna(r.get("Full SKU")) else ""
-        style = r.get("款式") if pd.notna(r.get("款式")) else ""
+        # 优先使用图册的款式名（图册被 enrich_orders 写入"款式_最终"）
+        style = (
+            r.get("款式_最终") if "款式_最终" in r.index and r.get("款式_最终") else
+            (r.get("款式") if pd.notna(r.get("款式")) else "")
+        )
         size = r.get("Size") if pd.notna(r.get("Size")) else ""
 
         # 标题
@@ -531,20 +615,28 @@ st.caption("上传 Lark 水单 → 选日期 → 一键生成拣货表 / Packing
 with st.sidebar:
     st.header("📤 文件上传")
     lark_file = st.file_uploader(
-        "Lark 水单 CSV",
+        "1️⃣ Lark 水单 CSV",
         type=["csv"],
-        help="从 Lark 多维表格导出的 CSV",
+        help="从 Lark 多维表格导出的 CSV（含订单、Shipping Info、库位等）",
     )
-    catalog_files = st.file_uploader(
-        "产品图册（可选）",
-        type=["png", "jpg", "jpeg", "pdf"],
+    catalog_file = st.file_uploader(
+        "2️⃣ 产品图册 CSV",
+        type=["csv"],
+        help="含 SKU / 款式英文名 / 中文名 / 甲型 / 库位 / 图片文件名",
+    )
+    image_files = st.file_uploader(
+        "3️⃣ 产品图片（可选，用于拣货预览）",
+        type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
-        help="可上传产品图册供拣货时参考（不强制）",
+        help="文件名要与图册 CSV 的「图片」列对应（如 169.png）",
     )
 
     st.divider()
     st.markdown("**📦 发件人信息**")
-    st.caption(f"{SENDER_INFO['name']}\n{SENDER_INFO['address']}\n{SENDER_INFO['city']}, {SENDER_INFO['state']} {SENDER_INFO['zip']}")
+    st.caption(
+        f"{SENDER_INFO['name']}\n{SENDER_INFO['address']}\n"
+        f"{SENDER_INFO['city']}, {SENDER_INFO['state']} {SENDER_INFO['zip']}"
+    )
 
 if lark_file is None:
     st.info("👈 请先在左侧上传 Lark 水单 CSV 文件")
@@ -577,6 +669,28 @@ with col1:
 # 筛选订单
 orders = filter_orders_for_date(df, selected_date)
 
+# 富集（图册接入）
+catalog = None
+if catalog_file is not None:
+    try:
+        catalog = load_catalog(catalog_file.read())
+    except Exception as e:
+        st.error(f"产品图册 CSV 解析失败: {e}")
+
+orders = enrich_orders(orders, catalog)
+
+# 检测款式名是否被图册覆盖（提示用户脏数据被修复）
+if catalog is not None and len(orders) > 0:
+    diffs = orders[
+        orders["款式"].notna()
+        & (orders["款式_最终"] != "")
+        & (orders["款式"] != orders["款式_最终"])
+    ]
+    if len(diffs) > 0:
+        st.warning(
+            f"⚠️ 检测到 {len(diffs)} 单的款式名与图册不一致，已用图册数据覆盖（防止客诉）"
+        )
+
 with col2:
     st.subheader("📊 当日订单概况")
     m1, m2, m3, m4 = st.columns(4)
@@ -592,7 +706,8 @@ with col2:
         unique_skus = orders["Full SKU"].dropna().nunique()
         st.metric("SKU 种类", unique_skus)
     with m4:
-        location_count = orders["库位"].dropna().nunique()
+        loc_series = orders["库位_最终"] if "库位_最终" in orders.columns else orders["库位"]
+        location_count = loc_series.replace("", pd.NA).dropna().nunique()
         st.metric("拣货库位", location_count)
 
 if len(orders) == 0:
@@ -601,8 +716,13 @@ if len(orders) == 0:
 
 # 订单预览
 with st.expander("👀 订单明细预览", expanded=False):
-    preview_cols = ["Order ID", "款式", "Size", "Full SKU", "库位", "Shipping Info"]
-    preview = orders[[c for c in preview_cols if c in orders.columns]].copy()
+    preview_cols = [
+        "Order ID", "中文名", "款式_最终", "甲型", "Size", "Full SKU",
+        "库位_最终", "图片", "Shipping Info",
+    ]
+    preview = orders[[c for c in preview_cols if c in orders.columns]].rename(
+        columns={"款式_最终": "款式（图册）", "库位_最终": "库位"}
+    )
     st.dataframe(preview, use_container_width=True, height=300)
 
 st.divider()
@@ -644,14 +764,31 @@ if st.button("✨ 一键生成 3 个文件", type="primary", use_container_width
             use_container_width=True,
         )
 
-# 产品图册预览
-if catalog_files:
+# 产品图片预览（按拣货顺序，对应当天要拣的货）
+if image_files:
     st.divider()
-    st.subheader("📷 产品图册参考")
-    cols = st.columns(min(4, len(catalog_files)))
-    for i, f in enumerate(catalog_files):
-        with cols[i % len(cols)]:
-            if f.type.startswith("image/"):
-                st.image(f, caption=f.name, use_container_width=True)
-            else:
-                st.markdown(f"📄 {f.name}")
+    st.subheader("📷 当日拣货图片预览")
+    st.caption("按库位排序，与拣货表顺序一致。仓库小哥可对照本页拣货 ✅")
+
+    img_map = {f.name: f for f in image_files}
+
+    # 按库位排序
+    ordered = orders.sort_values(by=["库位_最终", "SKU_short"]).reset_index(drop=True)
+
+    # 每行 4 张图
+    per_row = 4
+    rows = [ordered.iloc[i:i + per_row] for i in range(0, len(ordered), per_row)]
+    for chunk in rows:
+        cols_ui = st.columns(len(chunk))
+        for col_ui, (_, r) in zip(cols_ui, chunk.iterrows()):
+            with col_ui:
+                img_name = r.get("图片", "")
+                cn = r.get("中文名", "")
+                en = r.get("款式_最终", "")
+                loc = r.get("库位_最终", "")
+                size = r.get("Size") if pd.notna(r.get("Size")) else ""
+                caption = f"📍 {loc} | {cn}\n{en} | {size}"
+                if img_name and img_name in img_map:
+                    st.image(img_map[img_name], caption=caption, use_container_width=True)
+                else:
+                    st.info(f"❓ 缺图\n\n{caption}")
