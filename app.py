@@ -1,13 +1,13 @@
 """
 NailVesta 发货系统
-- 上传 Lark 水单 CSV
-- 上传产品图册 CSV（提供准确的款式名/中文名/甲型/库位/图片）
-- (可选) 上传产品图片文件夹（拣货时显示）
+-----------------------------------------------------------
+- 上传 Lark 水单 CSV、产品图册 CSV
 - 选择洛杉矶日期（默认最晚日期）
-- 生成 3 个文件：
-  1. 拣货表（显示库位 + 中文名 + 英文款式 + 甲型 + 图片名）
-  2. Packing Slip（客户发货单，款式以图册为准）
-  3. 买 Label 的 Excel（物流水单）
+- 生成 3 个 CSV：
+  1. 拣货表（按库位排序，组合装拆成多行）
+     列: 拣货顺序 / 库位 / 中文名 / 英文款式 / Size / Order ID / 收件人
+  2. Packing Slip（按订单分组，含真实款式 + 收件人地址）
+  3. 买 Label 的水单（每单一行，与你原 0430 模板字段一致）
 """
 
 import io
@@ -17,12 +17,9 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
 # ============================================================
-# 常量：发件人信息（NailVesta 固定信息）
+# 常量
 # ============================================================
 SENDER_INFO = {
     "name": "NailVesta",
@@ -35,20 +32,12 @@ SENDER_INFO = {
     "address": "515 S Flower St, Floor 18 & 19, STE 1901",
 }
 
-# 包裹规格默认值
 PACKAGE_DEFAULTS = {
-    "weight": 0.3,
-    "length": 20,
-    "width": 15,
-    "height": 2,
-    "cn_name": "穿戴甲",
-    "en_name": "Press-On Nails",
-    "qty": 1,
-    "declare_price": 5,
-    "net_weight": 0.3,
+    "weight": 0.3, "length": 20, "width": 15, "height": 2,
+    "cn_name": "穿戴甲", "en_name": "Press-On Nails",
+    "qty": 1, "declare_price": 5, "net_weight": 0.3,
 }
 
-# 水单 Excel 列头（与现有模板完全一致）
 SHUIDAN_HEADERS = [
     "客户订单号", "物流产品(产品编号)", "重量", "长", "宽", "高",
     "发件人姓名", "发件人公司", "发件人电话", "发件人国家", "发件人省/州",
@@ -59,9 +48,10 @@ SHUIDAN_HEADERS = [
     "申报单价1", "单位净重(kg)1",
 ]
 
+SIZE_COL = "Size'"  # Lark 里带撇号的那列才是真 size
 
 # ============================================================
-# 工具函数
+# 地址解析
 # ============================================================
 _US_STATES_FULL = {
     "ALABAMA","ALASKA","ARIZONA","ARKANSAS","CALIFORNIA","COLORADO","CONNECTICUT",
@@ -80,6 +70,31 @@ _STATE_ABBR = {
     "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
     "VA","WA","WV","WI","WY","DC","PR",
 }
+_STATE_FULL_TO_ABBR = {
+    "ALABAMA":"AL","ALASKA":"AK","ARIZONA":"AZ","ARKANSAS":"AR","CALIFORNIA":"CA",
+    "COLORADO":"CO","CONNECTICUT":"CT","DELAWARE":"DE","FLORIDA":"FL","GEORGIA":"GA",
+    "HAWAII":"HI","IDAHO":"ID","ILLINOIS":"IL","INDIANA":"IN","IOWA":"IA",
+    "KANSAS":"KS","KENTUCKY":"KY","LOUISIANA":"LA","MAINE":"ME","MARYLAND":"MD",
+    "MASSACHUSETTS":"MA","MICHIGAN":"MI","MINNESOTA":"MN","MISSISSIPPI":"MS",
+    "MISSOURI":"MO","MONTANA":"MT","NEBRASKA":"NE","NEVADA":"NV","NEW HAMPSHIRE":"NH",
+    "NEW JERSEY":"NJ","NEW MEXICO":"NM","NEW YORK":"NY","NORTH CAROLINA":"NC",
+    "NORTH DAKOTA":"ND","OHIO":"OH","OKLAHOMA":"OK","OREGON":"OR","PENNSYLVANIA":"PA",
+    "RHODE ISLAND":"RI","SOUTH CAROLINA":"SC","SOUTH DAKOTA":"SD","TENNESSEE":"TN",
+    "TEXAS":"TX","UTAH":"UT","VERMONT":"VT","VIRGINIA":"VA","WASHINGTON":"WA",
+    "WEST VIRGINIA":"WV","WISCONSIN":"WI","WYOMING":"WY","DISTRICT OF COLUMBIA":"DC",
+    "PUERTO RICO":"PR",
+}
+
+
+def state_to_abbr(state: str) -> str:
+    if not state:
+        return ""
+    s = state.strip().upper()
+    if s in _STATE_FULL_TO_ABBR:
+        return _STATE_FULL_TO_ABBR[s]
+    if s in _STATE_ABBR:
+        return s
+    return state if len(state) == 2 else state
 
 
 def _is_zip(s: str) -> bool:
@@ -87,20 +102,15 @@ def _is_zip(s: str) -> bool:
 
 
 def _is_phone_line(s: str) -> bool:
-    if re.match(
-        r"^[\sa]*\(?\+?1?\)?[\s\-\.]?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}",
-        s.strip(),
-    ):
+    if re.match(r"^[\sa]*\(?\+?1?\)?[\s\-\.]?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}", s.strip()):
         return True
     return bool(re.match(r"^(Tel|Phone|WhatsApp)\s*[:\uff1a]", s.strip(), re.I))
 
 
 def _normalize_state(tok: str) -> Optional[str]:
     t = tok.strip().upper()
-    if t in _US_STATES_FULL:
-        return t
-    if t in _STATE_ABBR:
-        return t
+    if t in _US_STATES_FULL: return t
+    if t in _STATE_ABBR: return t
     return None
 
 
@@ -112,7 +122,6 @@ def _clean_phone(s: str) -> str:
 
 
 def _clean_street(s: str) -> str:
-    # "(Apt 5)" / "(Leave Inside Porch)" -> 用空格替代两端括号
     s = re.sub(r"\(([^)]*)\)", r" \1", s)
     s = re.sub(r"#\s+", "#", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -120,71 +129,49 @@ def _clean_street(s: str) -> str:
 
 
 def parse_shipping_info(text: str) -> dict:
-    """
-    鲁棒解析多种格式的 Shipping Info：
-      - 标准 5 行：姓名 / 电话 / 街道 / 城市,州,国家 / 邮编
-      - 紧凑 4 行：街道+城市挤一行
-      - 6 行（含 Address Line 2 / 顺序变化）
-      - 7 行带 "Name:/Tel:/Address:" 前缀
-      - 开头中文备注（自动跳过）
-    """
-    if not isinstance(text, str):
-        return {}
-    lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
+    """鲁棒解析多种 Shipping Info 格式（4/5/6/7 行）"""
+    if not isinstance(text, str): return {}
+    lines = [ln.strip() for ln in text.replace("\r","").split("\n") if ln.strip()]
     while lines and re.search(r"[\u4e00-\u9fff]", lines[0]) and len(lines[0]) > 15:
         lines.pop(0)
-    if not lines:
-        return {}
+    if not lines: return {}
 
-    info = {
-        "name": "", "phone": "", "street": "", "street2": "",
-        "city": "", "state": "", "country": "United States", "zip": "",
-    }
+    info = {"name":"", "phone":"", "street":"", "street2":"",
+            "city":"", "state":"", "country":"United States", "zip":""}
 
-    # ZIP（最后一个独立 5 位邮编）
     zip_idx = None
-    for i in range(len(lines) - 1, -1, -1):
+    for i in range(len(lines)-1, -1, -1):
         if _is_zip(lines[i]):
             zip_idx = i
             info["zip"] = lines[i].strip()
             break
 
-    # Phone
     phone_idx = None
     for i, ln in enumerate(lines):
-        if i == zip_idx:
-            continue
+        if i == zip_idx: continue
         if _is_phone_line(ln):
             info["phone"] = _clean_phone(ln)
             phone_idx = i
             break
 
-    # City, State, Country
     csc_idx = None
-    csc_inline_street = None
     for i, ln in enumerate(lines):
-        if i in (zip_idx, phone_idx):
-            continue
+        if i in (zip_idx, phone_idx): continue
         if "," in ln:
             parts = [p.strip() for p in ln.split(",")]
-            if (
-                any("UNITED STATES" in p.upper() or "USA" in p.upper() for p in parts)
-                and len(parts) >= 3
-            ):
-                st = _normalize_state(parts[-2])
-                if st:
-                    info["state"] = st
+            if (any("UNITED STATES" in p.upper() or "USA" in p.upper() for p in parts)
+                    and len(parts) >= 3):
+                st_ = _normalize_state(parts[-2])
+                if st_:
+                    info["state"] = st_
                     info["country"] = parts[-1]
                     head = parts[0]
                     csc_idx = i
                     has_digit = bool(re.search(r"\d", head))
-                    m = re.match(
-                        r"^(.*?)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*$", head
-                    )
+                    m = re.match(r"^(.*?)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*$", head)
                     if has_digit and m and re.search(r"\d", m.group(1)):
                         info["street"] = m.group(1).strip()
                         info["city"] = m.group(2).strip()
-                        csc_inline_street = info["street"]
                     else:
                         info["city"] = head
                     break
@@ -192,7 +179,6 @@ def parse_shipping_info(text: str) -> dict:
     used = {zip_idx, phone_idx, csc_idx}
     others = [(i, lines[i]) for i in range(len(lines)) if i not in used]
 
-    # 姓名：第一个不含数字、逗号、冒号的行
     name_pos = None
     for k, (i, ln) in enumerate(others):
         clean = re.sub(r"^Name\s*[:\uff1a]\s*", "", ln, flags=re.I)
@@ -202,9 +188,7 @@ def parse_shipping_info(text: str) -> dict:
             break
 
     street_lines = [
-        re.sub(
-            r"^(Address|Street|Apt|Suite)\s*[:\uff1a]\s*", "", ln, flags=re.I
-        )
+        re.sub(r"^(Address|Street|Apt|Suite)\s*[:\uff1a]\s*", "", ln, flags=re.I)
         for k, (i, ln) in enumerate(others) if k != name_pos
     ]
 
@@ -219,36 +203,12 @@ def parse_shipping_info(text: str) -> dict:
 
     info["street"] = _clean_street(info["street"])
     info["street2"] = _clean_street(info["street2"]) if info["street2"] else ""
-
     return info
 
 
-def state_to_abbr(state: str) -> str:
-    """全名 → 缩写（数据多用全名，水单需要缩写）"""
-    mapping = {
-        "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR",
-        "CALIFORNIA": "CA", "COLORADO": "CO", "CONNECTICUT": "CT",
-        "DELAWARE": "DE", "FLORIDA": "FL", "GEORGIA": "GA", "HAWAII": "HI",
-        "IDAHO": "ID", "ILLINOIS": "IL", "INDIANA": "IN", "IOWA": "IA",
-        "KANSAS": "KS", "KENTUCKY": "KY", "LOUISIANA": "LA", "MAINE": "ME",
-        "MARYLAND": "MD", "MASSACHUSETTS": "MA", "MICHIGAN": "MI",
-        "MINNESOTA": "MN", "MISSISSIPPI": "MS", "MISSOURI": "MO",
-        "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV",
-        "NEW HAMPSHIRE": "NH", "NEW JERSEY": "NJ", "NEW MEXICO": "NM",
-        "NEW YORK": "NY", "NORTH CAROLINA": "NC", "NORTH DAKOTA": "ND",
-        "OHIO": "OH", "OKLAHOMA": "OK", "OREGON": "OR", "PENNSYLVANIA": "PA",
-        "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC", "SOUTH DAKOTA": "SD",
-        "TENNESSEE": "TN", "TEXAS": "TX", "UTAH": "UT", "VERMONT": "VT",
-        "VIRGINIA": "VA", "WASHINGTON": "WA", "WEST VIRGINIA": "WV",
-        "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC",
-        "PUERTO RICO": "PR",
-    }
-    if not state:
-        return ""
-    s = state.strip().upper()
-    return mapping.get(s, state if len(state) == 2 else state)
-
-
+# ============================================================
+# 数据加载
+# ============================================================
 @st.cache_data(show_spinner=False)
 def load_lark_data(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(file_bytes))
@@ -258,378 +218,251 @@ def load_lark_data(file_bytes: bytes) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_catalog(file_bytes: bytes) -> pd.DataFrame:
-    """加载产品图册 CSV，返回以 SKU 为索引的 DataFrame"""
     df = pd.read_csv(io.BytesIO(file_bytes))
-    # 标准化列：保留有用字段
-    keep = ["SKU", "中文名称", "款式英文名称", "甲型", "厂家", "图片", "库位", "所属系列"]
+    keep = ["SKU", "中文名称", "款式英文名称", "甲型", "图片", "库位", "所属系列"]
     keep = [c for c in keep if c in df.columns]
     df = df[keep].copy()
     df["SKU"] = df["SKU"].astype(str).str.strip()
+    if "款式英文名称" in df.columns:
+        df["款式英文名称"] = df["款式英文名称"].astype(str).str.strip()
     return df
 
 
-def extract_sku_short(full_sku: str) -> str:
-    """从 Full SKU 提取基础 SKU：'NMF004-M' -> 'NMF004'"""
-    if not isinstance(full_sku, str):
-        return ""
-    m = re.match(r"^(N[A-Z]{2}\d+)", full_sku.strip())
-    return m.group(1) if m else full_sku.split("-")[0].strip()
-
-
-def enrich_orders(orders: pd.DataFrame, catalog: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """
-    用图册数据富集订单：
-    - 款式英文（图册优先，覆盖 Lark 脏数据）
-    - 中文名（仅图册有）
-    - 甲型（仅图册有）
-    - 库位（图册优先，Lark 兜底）
-    - 图片文件名（仅图册有）
-    """
-    out = orders.copy()
-    out["SKU_short"] = out["Full SKU"].apply(extract_sku_short)
-
-    if catalog is None or catalog.empty:
-        out["款式_最终"] = out["款式"].fillna("")
-        out["中文名"] = ""
-        out["甲型"] = ""
-        out["库位_最终"] = out["库位"].fillna("")
-        out["图片"] = ""
-        return out
-
-    cat_idx = catalog.set_index("SKU")
-    def lookup(sku, col):
-        if sku in cat_idx.index and col in cat_idx.columns:
-            v = cat_idx.loc[sku, col]
-            if isinstance(v, pd.Series):
-                v = v.iloc[0]
-            return "" if pd.isna(v) else str(v)
-        return ""
-
-    out["款式_最终"] = out["SKU_short"].apply(lambda s: lookup(s, "款式英文名称"))
-    out.loc[out["款式_最终"] == "", "款式_最终"] = out["款式"].fillna("")
-
-    out["中文名"] = out["SKU_short"].apply(lambda s: lookup(s, "中文名称"))
-    out["甲型"] = out["SKU_short"].apply(lambda s: lookup(s, "甲型"))
-
-    cat_loc = out["SKU_short"].apply(lambda s: lookup(s, "库位"))
-    lark_loc = out["库位"].fillna("").astype(str).replace("nan", "")
-    out["库位_最终"] = cat_loc.where(cat_loc != "", lark_loc)
-
-    out["图片"] = out["SKU_short"].apply(lambda s: lookup(s, "图片"))
-    return out
-
-
 def filter_orders_for_date(df: pd.DataFrame, target_date: str) -> pd.DataFrame:
-    """筛选指定日期、有 Order ID 和 Shipping Info 的订单"""
     out = df[
         (df["日期"] == target_date)
         & df["Order ID"].notna()
         & df["Shipping Info"].notna()
     ].copy()
     out["Order ID"] = out["Order ID"].apply(
-        lambda x: str(int(x)) if isinstance(x, float) and x.is_integer() else str(x)
+        lambda x: str(int(x)) if isinstance(x, float) and float(x).is_integer() else str(x)
     )
     return out
 
 
 # ============================================================
-# 文件 1：拣货表（按库位排序）
+# 组合装拆单 + 图册富集
 # ============================================================
-def build_picking_list(orders: pd.DataFrame, date_str: str) -> bytes:
+def _parse_size(size_raw: str) -> dict:
     """
-    orders 已被 enrich_orders 富集，含：
-      库位_最终, SKU_short, Full SKU, 中文名, 款式_最终, 甲型, Size, 图片
+    解析 Size' 列，返回 dict:
+      {'_default': 'M'}                          标准单 size
+      {'Winery':'L', 'Ribbon':'M', '_default':''} 多款式分别 size
     """
+    s = str(size_raw).strip() if size_raw else ""
+    if ";" in s:
+        mapping = {"_default": s}
+        for part in s.split(";"):
+            part = part.strip()
+            m = re.match(r"^(.+?)\s+(S|M|L|XL|XS|\d+\s*个)$", part, re.I)
+            if m:
+                mapping[m.group(1).strip()] = m.group(2).strip()
+        return mapping
+    return {"_default": s}
+
+
+def explode_orders(orders: pd.DataFrame, catalog: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    按 Product Name 把组合装拆成多行。
+    每行: Order ID / 英文款式 / SKU / 中文名 / 库位 / Size / Shipping Info / Full SKU
+    """
+    cat_by_name = None
+    cat_by_sku = None
+    if catalog is not None and not catalog.empty:
+        if "款式英文名称" in catalog.columns:
+            tmp = catalog.dropna(subset=["款式英文名称"]).copy()
+            tmp["_key"] = tmp["款式英文名称"].astype(str).str.strip().str.lower()
+            cat_by_name = tmp.set_index("_key")
+        cat_by_sku = catalog.set_index("SKU")
+
+    def lookup_by_name(name: str):
+        if cat_by_name is None or not name: return None
+        key = name.strip().lower()
+        if key in cat_by_name.index:
+            row = cat_by_name.loc[key]
+            if isinstance(row, pd.DataFrame): row = row.iloc[0]
+            return row
+        return None
+
+    def lookup_by_sku(sku: str):
+        if cat_by_sku is None or not sku: return None
+        if sku in cat_by_sku.index:
+            row = cat_by_sku.loc[sku]
+            if isinstance(row, pd.DataFrame): row = row.iloc[0]
+            return row
+        return None
+
     rows = []
     for _, r in orders.iterrows():
+        order_id = r["Order ID"]
+        ship_info = r.get("Shipping Info", "")
+        lark_loc = str(r.get("库位", "") or "").strip()
+        if lark_loc.lower() == "nan": lark_loc = ""
+
+        pn_raw = str(r.get("Product Name", "") or "").strip()
+        sku_raw = str(r.get("SKU", "") or "").strip()
+        size_raw = str(r.get(SIZE_COL, "") or "").strip()
+        if pn_raw.lower() == "nan": pn_raw = ""
+        if sku_raw.lower() == "nan": sku_raw = ""
+        if size_raw.lower() == "nan": size_raw = ""
+
+        pn_list = [p.strip() for p in pn_raw.split(",") if p.strip()] if pn_raw else []
+        sku_list = [s.strip() for s in sku_raw.split(",") if s.strip()] if sku_raw else []
+        size_map = _parse_size(size_raw)
+
+        n = max(len(pn_list), len(sku_list), 1)
+
+        for i in range(n):
+            name_i = pn_list[i] if i < len(pn_list) else ""
+            sku_i = sku_list[i] if i < len(sku_list) else ""
+
+            cat_row = lookup_by_name(name_i) if name_i else None
+            if cat_row is None:
+                cat_row = lookup_by_sku(sku_i) if sku_i else None
+
+            cn_name = ""
+            cat_loc = ""
+            cat_en_name = name_i
+            if cat_row is not None:
+                cn_v = cat_row.get("中文名称", "")
+                cn_name = "" if pd.isna(cn_v) else str(cn_v).strip()
+                loc_v = cat_row.get("库位", "")
+                cat_loc = "" if pd.isna(loc_v) else str(loc_v).strip()
+                if not name_i:
+                    en_v = cat_row.get("款式英文名称", "")
+                    cat_en_name = "" if pd.isna(en_v) else str(en_v).strip()
+                if not sku_i and cat_row.name:
+                    sku_i = str(cat_row.name)
+
+            size_i = size_map.get(name_i, size_map.get("_default", size_raw))
+            final_loc = cat_loc or lark_loc
+
+            rows.append({
+                "Order ID": order_id,
+                "英文款式": cat_en_name,
+                "SKU": sku_i,
+                "中文名": cn_name,
+                "库位": final_loc,
+                "Size": size_i,
+                "Shipping Info": ship_info,
+                "Full SKU": str(r.get("Full SKU", "") or "").strip(),
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 文件 1：拣货表 CSV
+# ============================================================
+def build_picking_csv(exploded: pd.DataFrame) -> bytes:
+    """列: 拣货顺序 / 库位 / 中文名 / 英文款式 / Size / Order ID / 收件人"""
+    rows = []
+    for _, r in exploded.iterrows():
         ship = parse_shipping_info(r.get("Shipping Info", ""))
-        size = r.get("Size") if pd.notna(r.get("Size")) else ""
-        # Size 可能是 "M"/"L"/"S"/"5个"等
         rows.append({
-            "库位": r.get("库位_最终") or "",
-            "SKU": r.get("SKU_short") or "",
-            "Full SKU": r.get("Full SKU") or "",
-            "中文名": r.get("中文名") or "",
-            "英文款式": r.get("款式_最终") or "",
-            "甲型": r.get("甲型") or "",
-            "Size": size,
-            "数量": 1,
-            "图片": r.get("图片") or "",
+            "库位": r["库位"] or "",
+            "中文名": r["中文名"] or "",
+            "英文款式": r["英文款式"] or "",
+            "Size": r["Size"] or "",
             "Order ID": r["Order ID"],
             "收件人": ship.get("name", ""),
         })
     df = pd.DataFrame(rows)
-    df = df.sort_values(by=["库位", "SKU"], na_position="last").reset_index(drop=True)
+    df["_loc_sort"] = df["库位"].apply(lambda x: (x == "", x))
+    df = df.sort_values(by=["_loc_sort", "英文款式"]).drop(columns=["_loc_sort"]).reset_index(drop=True)
     df.insert(0, "拣货顺序", range(1, len(df) + 1))
-    df["√"] = ""
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "拣货表"
-
-    title_font = Font(name="Arial", size=14, bold=True)
-    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", start_color="305496")
-    border = Border(*[Side(style="thin", color="BFBFBF")] * 4)
-
-    cols = list(df.columns)
-    n_cols = len(cols)
-
-    ws["A1"] = f"NailVesta 拣货表 - {date_str}"
-    ws["A1"].font = title_font
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
-    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-
-    ws["A2"] = f"共 {len(df)} 单    （按库位排序，便于一次走完所有货架）"
-    ws["A2"].font = Font(name="Arial", size=10, italic=True, color="595959")
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n_cols)
-
-    for c, h in enumerate(cols, 1):
-        cell = ws.cell(row=4, column=c, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
-
-    for r_idx, row in enumerate(df.itertuples(index=False), 5):
-        for c_idx, val in enumerate(row, 1):
-            cell = ws.cell(row=r_idx, column=c_idx, value=val)
-            cell.font = Font(name="Arial", size=10)
-            col_name = cols[c_idx - 1]
-            cell.alignment = Alignment(
-                horizontal="center" if col_name in ("拣货顺序", "数量", "√", "Size", "甲型") else "left",
-                vertical="center",
-                wrap_text=True,
-            )
-            cell.border = border
-            if col_name == "库位":
-                cell.font = Font(name="Arial", size=10, bold=True, color="C00000")
-            elif col_name == "中文名":
-                cell.font = Font(name="Arial", size=10, bold=True)
-
-    widths = {
-        "拣货顺序": 7, "库位": 11, "SKU": 9, "Full SKU": 12, "中文名": 12,
-        "英文款式": 20, "甲型": 11, "Size": 7, "数量": 6, "图片": 18,
-        "Order ID": 22, "收件人": 18, "√": 4,
-    }
-    for c, h in enumerate(cols, 1):
-        ws.column_dimensions[get_column_letter(c)].width = widths.get(h, 12)
-    ws.row_dimensions[4].height = 22
-    ws.freeze_panes = "A5"
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 # ============================================================
-# 文件 2：Packing Slip
+# 文件 2：Packing Slip CSV
 # ============================================================
-def build_packing_slip(orders: pd.DataFrame, date_str: str) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Packing Slips"
+def build_packing_slip_csv(exploded: pd.DataFrame, date_str: str) -> bytes:
+    """每个订单一段，含完整收件人 + 所有商品行"""
+    rows = []
+    for order_id, grp in exploded.groupby("Order ID", sort=False):
+        first = grp.iloc[0]
+        ship = parse_shipping_info(first.get("Shipping Info", ""))
+        addr_parts = [p for p in [
+            ship.get("street", ""),
+            ship.get("street2", ""),
+            f"{ship.get('city','')}, {state_to_abbr(ship.get('state',''))} {ship.get('zip','')}".strip(", "),
+            ship.get("country", "United States"),
+        ] if p.strip(" ,")]
+        full_address = " | ".join(addr_parts)
 
-    title_font = Font(name="Arial", size=16, bold=True, color="305496")
-    label_font = Font(name="Arial", size=9, bold=True, color="595959")
-    val_font = Font(name="Arial", size=11)
-    name_font = Font(name="Arial", size=12, bold=True)
-    thank_font = Font(name="Arial", size=10, italic=True, color="595959")
+        for _, r in grp.iterrows():
+            rows.append({
+                "Order ID": order_id,
+                "Date": date_str,
+                "Recipient": ship.get("name", "").title() if ship.get("name") else "",
+                "Phone": ship.get("phone", ""),
+                "Address": full_address,
+                "SKU": r["SKU"] or "",
+                "Style": r["英文款式"] or "",
+                "Chinese Name": r["中文名"] or "",
+                "Size": r["Size"] or "",
+                "Qty": 1,
+            })
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False).encode("utf-8-sig")
 
-    thin = Side(style="thin", color="BFBFBF")
-    box = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    cur = 1
+# ============================================================
+# 文件 3：水单 CSV（每订单一行）
+# ============================================================
+def build_shuidan_csv(orders: pd.DataFrame) -> bytes:
+    rows = []
     for _, r in orders.iterrows():
         ship = parse_shipping_info(r.get("Shipping Info", ""))
-        order_id = r["Order ID"]
-        sku = r.get("Full SKU") if pd.notna(r.get("Full SKU")) else ""
-        # 优先使用图册的款式名（图册被 enrich_orders 写入"款式_最终"）
-        style = (
-            r.get("款式_最终") if "款式_最终" in r.index and r.get("款式_最终") else
-            (r.get("款式") if pd.notna(r.get("款式")) else "")
-        )
-        size = r.get("Size") if pd.notna(r.get("Size")) else ""
-
-        # 标题
-        ws.cell(row=cur, column=1, value="NailVesta").font = title_font
-        ws.cell(row=cur, column=4, value=f"Date: {date_str}").font = Font(name="Arial", size=10)
-        ws.cell(row=cur, column=4).alignment = Alignment(horizontal="right")
-        cur += 1
-
-        ws.cell(row=cur, column=1, value="PACKING SLIP").font = Font(name="Arial", size=11, bold=True, color="305496")
-        cur += 2
-
-        # 订单信息
-        ws.cell(row=cur, column=1, value="ORDER #").font = label_font
-        ws.cell(row=cur, column=2, value=order_id).font = val_font
-        cur += 1
-
-        # 收件人区块
-        ws.cell(row=cur, column=1, value="SHIP TO").font = label_font
-        cur += 1
-        ws.cell(row=cur, column=1, value=ship.get("name", "").title()).font = name_font
-        cur += 1
-        ws.cell(row=cur, column=1, value=ship.get("street", "")).font = val_font
-        cur += 1
-        ws.cell(
-            row=cur, column=1,
-            value=f"{ship.get('city','')}, {state_to_abbr(ship.get('state',''))} {ship.get('zip','')}",
-        ).font = val_font
-        cur += 1
-        ws.cell(row=cur, column=1, value=ship.get("country", "United States")).font = val_font
-        cur += 2
-
-        # 商品表头
-        for c, h in enumerate(["SKU", "Style", "Size", "Qty"], 1):
-            cell = ws.cell(row=cur, column=c, value=h)
-            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", start_color="305496")
-            cell.alignment = Alignment(horizontal="center")
-            cell.border = box
-        cur += 1
-
-        # 商品行
-        items = [(sku, style, size, 1)]
-        for sku_v, style_v, size_v, qty_v in items:
-            for c, val in enumerate([sku_v, style_v, size_v, qty_v], 1):
-                cell = ws.cell(row=cur, column=c, value=val)
-                cell.font = val_font
-                cell.alignment = Alignment(
-                    horizontal="center" if c in (3, 4) else "left",
-                    vertical="center",
-                )
-                cell.border = box
-            cur += 1
-
-        cur += 1
-        ws.cell(
-            row=cur, column=1,
-            value="Thank you for shopping with NailVesta! 💅 We hope you love your nails!",
-        ).font = thank_font
-        ws.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=4)
-        cur += 1
-        ws.cell(
-            row=cur, column=1,
-            value="Tag us @nailvesta on Instagram & TikTok to be featured ✨",
-        ).font = thank_font
-        ws.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=4)
-        cur += 2
-
-        # 分隔
-        for c in range(1, 5):
-            ws.cell(row=cur, column=c).border = Border(top=Side(style="medium", color="305496"))
-        cur += 2
-
-    widths = [22, 28, 12, 14]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    # 每张 Slip 设置打印分页（每订单约 17 行）
-    ws.print_options.horizontalCentered = True
-    ws.page_margins.left = 0.5
-    ws.page_margins.right = 0.5
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
-
-
-# ============================================================
-# 文件 3：买 Label 的水单 Excel（与现有模板完全一致）
-# ============================================================
-def build_shuidan(orders: pd.DataFrame, date_str: str) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "sheet1"
-
-    # 表头
-    for c, h in enumerate(SHUIDAN_HEADERS, 1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(name="宋体", size=11, bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # 数据行
-    for r_idx, (_, r) in enumerate(orders.iterrows(), 2):
-        ship = parse_shipping_info(r.get("Shipping Info", ""))
-        order_id = r["Order ID"]
-
-        row_vals = [
-            order_id,                                # 客户订单号
-            None,                                    # 物流产品(产品编号)
-            PACKAGE_DEFAULTS["weight"],              # 重量
-            PACKAGE_DEFAULTS["length"],              # 长
-            PACKAGE_DEFAULTS["width"],               # 宽
-            PACKAGE_DEFAULTS["height"],              # 高
-            SENDER_INFO["name"],                     # 发件人姓名
-            SENDER_INFO["company"],                  # 发件人公司
-            SENDER_INFO["phone"],                    # 发件人电话
-            SENDER_INFO["country"],                  # 发件人国家
-            SENDER_INFO["state"],                    # 发件人省/州
-            SENDER_INFO["city"],                     # 发件人城市
-            SENDER_INFO["zip"],                      # 发件人邮编
-            SENDER_INFO["address"],                  # 发件人地址
-            ship.get("name", ""),                    # 收件人姓名
-            None,                                    # 收件人公司
-            ship.get("phone", ""),                   # 收件人电话
-            "US",                                    # 收件人国家
-            state_to_abbr(ship.get("state", "")),    # 收件人省/州
-            ship.get("city", ""),                    # 收件人城市
-            ship.get("street", ""),                  # 收件人地址一
-            ship.get("street2", "") or None,         # 收件人地址二
-            ship.get("zip", ""),                     # 收件人邮编
-            PACKAGE_DEFAULTS["cn_name"],             # 中文品名1
-            PACKAGE_DEFAULTS["en_name"],             # 英文品名1
-            None,                                    # SKU1
-            PACKAGE_DEFAULTS["qty"],                 # 数量1
-            None,                                    # 配货备注1
-            PACKAGE_DEFAULTS["declare_price"],       # 申报单价1
-            PACKAGE_DEFAULTS["net_weight"],          # 单位净重(kg)1
-        ]
-        for c, v in enumerate(row_vals, 1):
-            cell = ws.cell(row=r_idx, column=c, value=v)
-            cell.font = Font(name="宋体", size=10)
-
-    # 列宽
-    for c in range(1, len(SHUIDAN_HEADERS) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 14
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
+        rows.append({
+            "客户订单号": r["Order ID"],
+            "物流产品(产品编号)": "",
+            "重量": PACKAGE_DEFAULTS["weight"],
+            "长": PACKAGE_DEFAULTS["length"],
+            "宽": PACKAGE_DEFAULTS["width"],
+            "高": PACKAGE_DEFAULTS["height"],
+            "发件人姓名": SENDER_INFO["name"],
+            "发件人公司": "",
+            "发件人电话": SENDER_INFO["phone"],
+            "发件人国家": SENDER_INFO["country"],
+            "发件人省/州": SENDER_INFO["state"],
+            "发件人城市": SENDER_INFO["city"],
+            "发件人邮编": SENDER_INFO["zip"],
+            "发件人地址": SENDER_INFO["address"],
+            "收件人姓名": ship.get("name", ""),
+            "收件人公司": "",
+            "收件人电话": ship.get("phone", ""),
+            "收件人国家": "US",
+            "收件人省/州": state_to_abbr(ship.get("state", "")),
+            "收件人城市": ship.get("city", ""),
+            "收件人地址一": ship.get("street", ""),
+            "收件人地址二": ship.get("street2", ""),
+            "收件人邮编": ship.get("zip", ""),
+            "中文品名1": PACKAGE_DEFAULTS["cn_name"],
+            "英文品名1": PACKAGE_DEFAULTS["en_name"],
+            "SKU1": "",
+            "数量1": PACKAGE_DEFAULTS["qty"],
+            "配货备注1": "",
+            "申报单价1": PACKAGE_DEFAULTS["declare_price"],
+            "单位净重(kg)1": PACKAGE_DEFAULTS["net_weight"],
+        })
+    df = pd.DataFrame(rows, columns=SHUIDAN_HEADERS)
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 # ============================================================
 # Streamlit UI
 # ============================================================
-st.set_page_config(
-    page_title="NailVesta 发货系统",
-    page_icon="💅",
-    layout="wide",
-)
+st.set_page_config(page_title="NailVesta 发货系统", page_icon="💅", layout="wide")
 
 st.title("💅 NailVesta 发货系统")
-st.caption("上传 Lark 水单 → 选日期 → 一键生成拣货表 / Packing Slip / 买 Label 水单")
+st.caption("Lark CSV + 图册 CSV → 一键生成 拣货表 / Packing Slip / 水单（CSV）")
 
-# 侧栏：上传
 with st.sidebar:
     st.header("📤 文件上传")
-    lark_file = st.file_uploader(
-        "1️⃣ Lark 水单 CSV",
-        type=["csv"],
-        help="从 Lark 多维表格导出的 CSV（含订单、Shipping Info、库位等）",
-    )
-    catalog_file = st.file_uploader(
-        "2️⃣ 产品图册 CSV",
-        type=["csv"],
-        help="含 SKU / 款式英文名 / 中文名 / 甲型 / 库位 / 图片文件名",
-    )
-    image_files = st.file_uploader(
-        "3️⃣ 产品图片（可选，用于拣货预览）",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        help="文件名要与图册 CSV 的「图片」列对应（如 169.png）",
-    )
+    lark_file = st.file_uploader("1️⃣ Lark 水单 CSV", type=["csv"])
+    catalog_file = st.file_uploader("2️⃣ 产品图册 CSV", type=["csv"])
 
     st.divider()
     st.markdown("**📦 发件人信息**")
@@ -639,26 +472,33 @@ with st.sidebar:
     )
 
 if lark_file is None:
-    st.info("👈 请先在左侧上传 Lark 水单 CSV 文件")
+    st.info("👈 请先在左侧上传 Lark 水单 CSV")
     st.stop()
 
-# 加载数据
 df = load_lark_data(lark_file.read())
 all_dates = sorted(
-    [d for d in df["日期"].dropna().unique() if re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", str(d))],
+    [d for d in df["日期"].dropna().unique()
+     if re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", str(d))],
     key=lambda x: datetime.strptime(x, "%Y/%m/%d"),
     reverse=True,
 )
 
 if not all_dates:
-    st.error("CSV 中找不到合法日期，请检查 Lark 导出格式")
+    st.error("CSV 中找不到合法日期")
     st.stop()
 
-# 日期选择
+catalog = None
+if catalog_file is not None:
+    try:
+        catalog = load_catalog(catalog_file.read())
+        st.sidebar.success(f"✅ 图册已加载（{len(catalog)} 个 SKU）")
+    except Exception as e:
+        st.sidebar.error(f"图册解析失败: {e}")
+
 col1, col2 = st.columns([1, 2])
 with col1:
     st.subheader("📅 选择日期")
-    st.caption("洛杉矶时间，默认最晚日期")
+    st.caption("洛杉矶时间，默认最晚")
     selected_date = st.selectbox(
         "发货日期",
         options=all_dates,
@@ -666,129 +506,72 @@ with col1:
         format_func=lambda x: f"{x} {'⬅️ 最新' if x == all_dates[0] else ''}",
     )
 
-# 筛选订单
 orders = filter_orders_for_date(df, selected_date)
-
-# 富集（图册接入）
-catalog = None
-if catalog_file is not None:
-    try:
-        catalog = load_catalog(catalog_file.read())
-    except Exception as e:
-        st.error(f"产品图册 CSV 解析失败: {e}")
-
-orders = enrich_orders(orders, catalog)
-
-# 检测款式名是否被图册覆盖（提示用户脏数据被修复）
-if catalog is not None and len(orders) > 0:
-    diffs = orders[
-        orders["款式"].notna()
-        & (orders["款式_最终"] != "")
-        & (orders["款式"] != orders["款式_最终"])
-    ]
-    if len(diffs) > 0:
-        st.warning(
-            f"⚠️ 检测到 {len(diffs)} 单的款式名与图册不一致，已用图册数据覆盖（防止客诉）"
-        )
+exploded = explode_orders(orders, catalog)
 
 with col2:
     st.subheader("📊 当日订单概况")
     m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("订单数", len(orders))
-    with m2:
-        unique_states = orders.apply(
-            lambda r: parse_shipping_info(r.get("Shipping Info", "")).get("state", ""),
-            axis=1,
-        ).nunique()
-        st.metric("覆盖州", unique_states)
-    with m3:
-        unique_skus = orders["Full SKU"].dropna().nunique()
-        st.metric("SKU 种类", unique_skus)
-    with m4:
-        loc_series = orders["库位_最终"] if "库位_最终" in orders.columns else orders["库位"]
-        location_count = loc_series.replace("", pd.NA).dropna().nunique()
-        st.metric("拣货库位", location_count)
+    m1.metric("订单数", len(orders))
+    extra = len(exploded) - len(orders)
+    m2.metric("拣货行数", len(exploded), delta=f"+{extra} 组合装" if extra > 0 else None)
+    m3.metric("SKU 种类", exploded["SKU"].replace("", pd.NA).dropna().nunique() if len(exploded) else 0)
+    m4.metric("拣货库位", exploded["库位"].replace("", pd.NA).dropna().nunique() if len(exploded) else 0)
 
 if len(orders) == 0:
-    st.warning(f"⚠️ {selected_date} 没有可发货订单（需同时有 Order ID 和 Shipping Info）")
+    st.warning(f"⚠️ {selected_date} 没有可发货订单")
     st.stop()
 
-# 订单预览
-with st.expander("👀 订单明细预览", expanded=False):
-    preview_cols = [
-        "Order ID", "中文名", "款式_最终", "甲型", "Size", "Full SKU",
-        "库位_最终", "图片", "Shipping Info",
-    ]
-    preview = orders[[c for c in preview_cols if c in orders.columns]].rename(
-        columns={"款式_最终": "款式（图册）", "库位_最终": "库位"}
-    )
-    st.dataframe(preview, use_container_width=True, height=300)
+if catalog is not None:
+    missing = exploded[(exploded["中文名"] == "") & (exploded["英文款式"] != "")]
+    if len(missing) > 0:
+        unmatched = missing["英文款式"].unique().tolist()
+        st.warning(
+            f"⚠️ {len(missing)} 行未在图册匹配到："
+            + ", ".join(unmatched[:10])
+            + ("..." if len(unmatched) > 10 else "")
+        )
+elif catalog is None:
+    st.info("💡 未上传产品图册，无法显示中文名和准确库位")
+
+with st.expander("👀 拆单后的拣货明细预览", expanded=True):
+    preview = exploded[["Order ID", "中文名", "英文款式", "SKU", "Size", "库位"]].copy()
+    st.dataframe(preview, use_container_width=True, height=350)
 
 st.divider()
 
-# 生成按钮
-st.subheader("🚀 生成发货文件")
-if st.button("✨ 一键生成 3 个文件", type="primary", use_container_width=True):
+st.subheader("🚀 生成发货文件（CSV）")
+if st.button("✨ 一键生成 3 个 CSV", type="primary", use_container_width=True):
     with st.spinner("生成中..."):
         date_compact = selected_date.replace("/", "")
-        picking_bytes = build_picking_list(orders, selected_date)
-        slip_bytes = build_packing_slip(orders, selected_date)
-        shuidan_bytes = build_shuidan(orders, selected_date)
+        picking_csv = build_picking_csv(exploded)
+        slip_csv = build_packing_slip_csv(exploded, selected_date)
+        shuidan_csv = build_shuidan_csv(orders)
 
-    st.success(f"✅ 已生成 {selected_date} 的 {len(orders)} 单发货文件！")
+    st.success(f"✅ 已生成 {selected_date} 的 {len(orders)} 单（拣货 {len(exploded)} 行）")
 
     c1, c2, c3 = st.columns(3)
     with c1:
         st.download_button(
-            "📋 1. 拣货表（按库位排序）",
-            data=picking_bytes,
-            file_name=f"拣货表_{date_compact}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "📋 1. 拣货表",
+            data=picking_csv,
+            file_name=f"拣货表_{date_compact}.csv",
+            mime="text/csv",
             use_container_width=True,
         )
     with c2:
         st.download_button(
-            "📦 2. Packing Slips",
-            data=slip_bytes,
-            file_name=f"PackingSlip_{date_compact}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "📦 2. Packing Slip",
+            data=slip_csv,
+            file_name=f"PackingSlip_{date_compact}.csv",
+            mime="text/csv",
             use_container_width=True,
         )
     with c3:
         st.download_button(
             "🚚 3. 水单（买 Label）",
-            data=shuidan_bytes,
-            file_name=f"{date_compact}客人水单.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            data=shuidan_csv,
+            file_name=f"{date_compact}客人水单.csv",
+            mime="text/csv",
             use_container_width=True,
         )
-
-# 产品图片预览（按拣货顺序，对应当天要拣的货）
-if image_files:
-    st.divider()
-    st.subheader("📷 当日拣货图片预览")
-    st.caption("按库位排序，与拣货表顺序一致。仓库小哥可对照本页拣货 ✅")
-
-    img_map = {f.name: f for f in image_files}
-
-    # 按库位排序
-    ordered = orders.sort_values(by=["库位_最终", "SKU_short"]).reset_index(drop=True)
-
-    # 每行 4 张图
-    per_row = 4
-    rows = [ordered.iloc[i:i + per_row] for i in range(0, len(ordered), per_row)]
-    for chunk in rows:
-        cols_ui = st.columns(len(chunk))
-        for col_ui, (_, r) in zip(cols_ui, chunk.iterrows()):
-            with col_ui:
-                img_name = r.get("图片", "")
-                cn = r.get("中文名", "")
-                en = r.get("款式_最终", "")
-                loc = r.get("库位_最终", "")
-                size = r.get("Size") if pd.notna(r.get("Size")) else ""
-                caption = f"📍 {loc} | {cn}\n{en} | {size}"
-                if img_name and img_name in img_map:
-                    st.image(img_map[img_name], caption=caption, use_container_width=True)
-                else:
-                    st.info(f"❓ 缺图\n\n{caption}")
