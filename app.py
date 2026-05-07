@@ -2,10 +2,15 @@
 NailVesta 发货系统（两阶段工作流）
 ========================================================
 阶段 1（生成水单）:
-    Lark CSV → 选日期 → 生成水单 CSV → 发给打 Label 的人
+    Lark CSV → 选日期 → 生成水单 → 发给打 Label 的人
+    分 3 类输出:
+      - 深度达人水单 (NailVesta 发出, 寄给达人)
+      - 客户水单     (NailVesta 发出, 寄给客户)
+      - Return Label 包裹 (顾客寄回, 顾客=发件人, NailVesta=收件人)
 
 阶段 2（拣货 + 发货 + 核对）:
     Lark CSV + 图册 CSV + Label PDF → OCR 核对 + 生成拣货单/发货单
+    Return Label 包裹不参与拣货核对（顾客寄回，无需我们打包）
 """
 
 import io
@@ -42,6 +47,7 @@ SHUIDAN_HEADERS = [
     "申报单价1","单位净重(kg)1",
 ]
 SIZE_COL = "Size'"
+RETURN_LABEL_COL = "Return Label 包裹"  # Lark 表里勾选的列名
 
 # ============================================================
 # 地址解析
@@ -113,23 +119,36 @@ def _clean_street(s):
     return s
 
 
+def is_return_label(val) -> bool:
+    """
+    判断 Return Label 包裹列是否打勾。
+    Lark 导出时打勾值是 1.0（float），未打勾是 0.0 或空。
+    兼容多种可能格式: 1.0/1/True/是/Y/✓ 等。
+    """
+    if val is None: return False
+    if isinstance(val, bool): return val
+    if isinstance(val, (int, float)):
+        try:
+            if pd.isna(val): return False
+        except Exception:
+            pass
+        return float(val) >= 1.0
+    if pd.isna(val): return False
+    s = str(val).strip().lower()
+    if not s or s == "nan" or s == "none" or s == "0" or s == "0.0":
+        return False
+    truthy = {"true", "1", "1.0", "yes", "y", "是", "✓", "✔", "✅",
+              "勾选", "checked", "x", "t", "已选"}
+    return s in truthy
+
+
 def parse_free_address(text: str) -> dict:
-    """
-    解析自由格式地址（深度达人单的"地址"字段是单行自由文本）
-    返回: {street, city, state, zip}
-    
-    案例:
-      "2101 blackstone landing dr kissimmee fl 34758"
-      "3987 Rocky Falls Ct, Ceres, CA, 95307"
-      "325 Wisconsin Ave apt. 25 El Cajon 92020 CA"  (邮编在前州在后)
-      "245 old town house road west Yarmouth, MA 02673"
-    """
+    """解析自由格式地址（深度达人单的"地址"字段是单行自由文本）"""
     if not isinstance(text, str): return {}
     s = text.strip().rstrip(",").strip()
     s = re.sub(r"\s*\n\s*", " ", s)
     s = re.sub(r"\s+", " ", s)
 
-    # 邮编：取最右的 5 位（避免误中街道号）
     zip_matches = list(re.finditer(r"\b(\d{5})(-\d{4})?\b", s))
     zip_code = ""
     zip_match = None
@@ -137,7 +156,6 @@ def parse_free_address(text: str) -> dict:
         zip_match = zip_matches[-1]
         zip_code = zip_match.group(1)
 
-    # 州：在邮编附近（前后 30 字符）找，避免 "Wisconsin Ave" 被误判
     state = ""
     state_pos = None
     if zip_match:
@@ -168,7 +186,6 @@ def parse_free_address(text: str) -> dict:
                 state_pos = m.start()
                 break
 
-    # 切分
     if state_pos is not None and zip_match is not None:
         cut = min(state_pos, zip_match.start())
     elif zip_match is not None:
@@ -179,7 +196,6 @@ def parse_free_address(text: str) -> dict:
         cut = len(s)
     before = s[:cut].rstrip(" ,.\t\n")
 
-    # 街道 / 城市
     if "," in before:
         parts = [p.strip() for p in before.split(",") if p.strip()]
         if len(parts) >= 2:
@@ -316,12 +332,10 @@ def filter_orders_for_date(df, target_date):
     type_b = is_date & (df["客诉类型"] == "深度达人") & df["地址"].notna() & df["达人Name"].notna()
     out = df[type_a | type_b].copy()
 
-    # 给深度达人单生成虚拟 Order ID（用 Handle，否则用 达人Name）
     def make_id(r):
         oid = r["Order ID"]
         if pd.notna(oid):
             return str(int(oid)) if isinstance(oid, float) and float(oid).is_integer() else str(oid)
-        # 深度达人：Handle 优先，没 Handle 用 达人Name
         handle = str(r.get("Handle", "") or "").strip()
         name = str(r.get("达人Name", "") or "").strip()
         return f"KOL-{handle}" if handle and handle.lower() != "nan" else f"KOL-{name}"
@@ -330,42 +344,54 @@ def filter_orders_for_date(df, target_date):
     return out
 
 
+def split_orders_by_type(orders: pd.DataFrame) -> dict:
+    """
+    把当日订单分成 4 类:
+      - kol:               正常发出的深度达人单 (NailVesta → 达人)
+      - customer:          正常发出的客户单    (NailVesta → 客户)
+      - return_label_kol:  Return Label + 深度达人形态 (达人 → NailVesta 寄回)
+      - return_label_cust: Return Label + 客户形态     (客户 → NailVesta 寄回)
+    深度达人形态判断：客诉类型 == "深度达人"
+    """
+    if RETURN_LABEL_COL in orders.columns:
+        is_ret = orders[RETURN_LABEL_COL].apply(is_return_label)
+    else:
+        is_ret = pd.Series([False] * len(orders), index=orders.index)
+
+    is_kol = orders["客诉类型"] == "深度达人"
+
+    return {
+        "kol":               orders[~is_ret &  is_kol].copy(),
+        "customer":          orders[~is_ret & ~is_kol].copy(),
+        "return_label_kol":  orders[ is_ret &  is_kol].copy(),
+        "return_label_cust": orders[ is_ret & ~is_kol].copy(),
+    }
+
+
 def is_kol_order(row) -> bool:
     """判断是否深度达人单"""
     return str(row.get("客诉类型", "") or "").strip() == "深度达人"
 
 
 def get_recipient_info(row) -> dict:
-    """
-    根据订单类型返回统一的收件人信息 dict:
-      {name, phone, street, street2, city, state, country, zip}
-    深度达人单从"达人Name"+"地址"解析；普通订单从"Shipping Info"解析。
-    """
+    """根据订单类型返回统一的收件人信息（正常发货时用）"""
     if is_kol_order(row):
         addr_raw = str(row.get("地址", "") or "").strip()
         parsed = parse_free_address(addr_raw)
         kol_name = str(row.get("达人Name", "") or "").strip()
         return {
-            "name": kol_name,
-            "phone": "",  # 深度达人单通常无电话
-            "street": parsed.get("street", ""),
-            "street2": "",
-            "city": parsed.get("city", ""),
-            "state": parsed.get("state", ""),
-            "country": "United States",
-            "zip": parsed.get("zip", ""),
+            "name": kol_name, "phone": "",
+            "street": parsed.get("street", ""), "street2": "",
+            "city": parsed.get("city", ""), "state": parsed.get("state", ""),
+            "country": "United States", "zip": parsed.get("zip", ""),
         }
     else:
         ship = parse_shipping_info(row.get("Shipping Info", ""))
         return {
-            "name": ship.get("name", ""),
-            "phone": ship.get("phone", ""),
-            "street": ship.get("street", ""),
-            "street2": ship.get("street2", ""),
-            "city": ship.get("city", ""),
-            "state": ship.get("state", ""),
-            "country": ship.get("country", "United States"),
-            "zip": ship.get("zip", ""),
+            "name": ship.get("name", ""), "phone": ship.get("phone", ""),
+            "street": ship.get("street", ""), "street2": ship.get("street2", ""),
+            "city": ship.get("city", ""), "state": ship.get("state", ""),
+            "country": ship.get("country", "United States"), "zip": ship.get("zip", ""),
         }
 
 
@@ -419,8 +445,6 @@ def explode_orders(orders, catalog):
 
         is_kol = is_kol_order(r)
 
-        # 深度达人单：用"款式"列（Lark 那一列），Size 用 Size 列
-        # 普通单：用 Product Name + Size'
         if is_kol:
             pn_raw = str(r.get("款式", "") or "").strip()
             sku_raw = str(r.get("SKU", "") or "").strip()
@@ -473,28 +497,22 @@ def explode_orders(orders, catalog):
 
 
 # ============================================================
-# 文件 1：拣货表（按库位汇总，符合截图格式）
+# 文件 1：拣货表（按库位汇总）
 # ============================================================
 def build_picking_summary_csv(exploded: pd.DataFrame) -> bytes:
-    """
-    按库位 + Product Name 汇总，每行: 库位 / Product Name / S / M / L / Total
-    """
     if len(exploded) == 0:
         return pd.DataFrame(columns=["库位","Product Name","S","M","L","其他","Total"]).to_csv(index=False).encode("utf-8-sig")
 
     df = exploded.copy()
     df["Size"] = df["Size"].fillna("").astype(str).str.strip().str.upper()
 
-    # 标准化 Size
     def size_bucket(s):
         if s in ("S","M","L"): return s
         if s in ("XS","XL"): return s
         return "其他"
     df["SizeBucket"] = df["Size"].apply(size_bucket)
 
-    # group
     grouped = df.groupby(["库位", "英文款式", "SizeBucket"]).size().unstack(fill_value=0)
-    # 确保 S/M/L 列存在
     for c in ["S","M","L"]:
         if c not in grouped.columns: grouped[c] = 0
     other_cols = [c for c in grouped.columns if c not in ("S","M","L")]
@@ -503,11 +521,9 @@ def build_picking_summary_csv(exploded: pd.DataFrame) -> bytes:
     grouped = grouped[["S","M","L","其他","Total"]].reset_index()
     grouped = grouped.rename(columns={"英文款式": "Product Name"})
 
-    # 排序：库位先，空库位最后
     grouped["_loc_sort"] = grouped["库位"].apply(lambda x: (x == "", x))
     grouped = grouped.sort_values(by=["_loc_sort", "Product Name"]).drop(columns=["_loc_sort"]).reset_index(drop=True)
 
-    # 如果"其他"列全是 0，就删掉
     if (grouped["其他"] == 0).all():
         grouped = grouped.drop(columns=["其他"])
 
@@ -521,32 +537,21 @@ def build_packing_slip_csv(exploded: pd.DataFrame, date_str: str) -> bytes:
     rows = []
     for order_id, grp in exploded.groupby("Order ID", sort=False):
         first = grp.iloc[0]
-        # 复用 get_recipient_info：但 grouped 后 first 是 Series，需要保留原始字段
-        # 我们在 explode_orders 里已经保留了 is_kol/Shipping Info/地址_raw/达人Name 等
-        # 所以这里直接构造一个 mock row 或调用解析
         if first.get("is_kol", False):
             recip_addr = parse_free_address(first.get("地址_raw", ""))
             recip = {
-                "name": first.get("达人Name", ""),
-                "phone": "",
-                "street": recip_addr.get("street", ""),
-                "street2": "",
-                "city": recip_addr.get("city", ""),
-                "state": recip_addr.get("state", ""),
-                "zip": recip_addr.get("zip", ""),
-                "country": "United States",
+                "name": first.get("达人Name", ""), "phone": "",
+                "street": recip_addr.get("street", ""), "street2": "",
+                "city": recip_addr.get("city", ""), "state": recip_addr.get("state", ""),
+                "zip": recip_addr.get("zip", ""), "country": "United States",
             }
         else:
             ship = parse_shipping_info(first.get("Shipping Info", ""))
             recip = {
-                "name": ship.get("name", ""),
-                "phone": ship.get("phone", ""),
-                "street": ship.get("street", ""),
-                "street2": ship.get("street2", ""),
-                "city": ship.get("city", ""),
-                "state": ship.get("state", ""),
-                "zip": ship.get("zip", ""),
-                "country": ship.get("country", "United States"),
+                "name": ship.get("name", ""), "phone": ship.get("phone", ""),
+                "street": ship.get("street", ""), "street2": ship.get("street2", ""),
+                "city": ship.get("city", ""), "state": ship.get("state", ""),
+                "zip": ship.get("zip", ""), "country": ship.get("country", "United States"),
             }
         addr_parts = [p for p in [
             recip["street"], recip["street2"],
@@ -567,77 +572,35 @@ def build_packing_slip_csv(exploded: pd.DataFrame, date_str: str) -> bytes:
 
 
 # ============================================================
-# 文件 3：水单 Excel（xlsx，强制邮编/电话/Order ID 为文本，避免前导零丢失）
+# 文件 3：水单 Excel（正常发货：NailVesta → 客户）
 # ============================================================
-def build_shuidan_xlsx(orders: pd.DataFrame) -> bytes:
-    """
-    生成水单 Excel 文件。关键设计:
-    - 邮编、电话、Order ID 这些"数字字符串"列强制为文本格式（@）
-    - 这样 Excel 打开时不会把 '03867' 自动转成 3867
-    - 物流系统读 xlsx 也能拿到正确字符串
-    """
+def _write_shuidan_workbook(rows_data: list) -> bytes:
+    """通用 xlsx 写入（已强制邮编/电话/Order ID 为文本格式）"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws = wb.active
     ws.title = "sheet1"
 
-    # 表头
     for c, h in enumerate(SHUIDAN_HEADERS, 1):
         cell = ws.cell(row=1, column=c, value=h)
         cell.font = Font(name="宋体", size=11, bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 数据行
-    for r_idx, (_, r) in enumerate(orders.iterrows(), 2):
-        recip = get_recipient_info(r)
-        row_vals = [
-            r["Order ID"],                                          # 客户订单号
-            None,                                                    # 物流产品(产品编号)
-            PACKAGE_DEFAULTS["weight"],                              # 重量
-            PACKAGE_DEFAULTS["length"],                              # 长
-            PACKAGE_DEFAULTS["width"],                               # 宽
-            PACKAGE_DEFAULTS["height"],                              # 高
-            SENDER_INFO["name"],                                     # 发件人姓名
-            None,                                                    # 发件人公司
-            SENDER_INFO["phone"],                                    # 发件人电话
-            SENDER_INFO["country"],                                  # 发件人国家
-            SENDER_INFO["state"],                                    # 发件人省/州
-            SENDER_INFO["city"],                                     # 发件人城市
-            SENDER_INFO["zip"],                                      # 发件人邮编
-            SENDER_INFO["address"],                                  # 发件人地址
-            recip["name"],                                           # 收件人姓名
-            None,                                                    # 收件人公司
-            recip["phone"],                                          # 收件人电话
-            "US",                                                    # 收件人国家
-            state_to_abbr(recip["state"]),                           # 收件人省/州
-            recip["city"],                                           # 收件人城市
-            recip["street"],                                         # 收件人地址一
-            recip["street2"] or None,                                # 收件人地址二
-            recip["zip"],                                            # 收件人邮编
-            PACKAGE_DEFAULTS["cn_name"],                             # 中文品名1
-            PACKAGE_DEFAULTS["en_name"],                             # 英文品名1
-            None,                                                    # SKU1
-            PACKAGE_DEFAULTS["qty"],                                 # 数量1
-            None,                                                    # 配货备注1
-            PACKAGE_DEFAULTS["declare_price"],                       # 申报单价1
-            PACKAGE_DEFAULTS["net_weight"],                          # 单位净重(kg)1
-        ]
+    for r_idx, row_vals in enumerate(rows_data, 2):
         for c, v in enumerate(row_vals, 1):
             cell = ws.cell(row=r_idx, column=c, value=v)
             cell.font = Font(name="宋体", size=10)
 
-    # 关键：把"数字字符串"列强制设为文本格式（@）
-    # 客户订单号(A=1) / 发件人电话(I=9) / 发件人邮编(M=13) / 收件人电话(Q=17) / 收件人邮编(W=23)
+    # 数字字符串列强制文本格式（客户订单号/发件人电话/发件人邮编/收件人电话/收件人邮编）
     text_cols = [1, 9, 13, 17, 23]
     for col_idx in text_cols:
         for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
             for cell in row:
                 cell.number_format = "@"
 
-    # 列宽
-    from openpyxl.utils import get_column_letter
     for c in range(1, len(SHUIDAN_HEADERS) + 1):
         ws.column_dimensions[get_column_letter(c)].width = 14
 
@@ -646,27 +609,79 @@ def build_shuidan_xlsx(orders: pd.DataFrame) -> bytes:
     return out.getvalue()
 
 
+def build_shuidan_xlsx(orders: pd.DataFrame) -> bytes:
+    """正常发货水单：NailVesta = 发件人，顾客/达人 = 收件人"""
+    rows_data = []
+    for _, r in orders.iterrows():
+        recip = get_recipient_info(r)
+        rows_data.append([
+            r["Order ID"], None,
+            PACKAGE_DEFAULTS["weight"], PACKAGE_DEFAULTS["length"],
+            PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
+            SENDER_INFO["name"], None, SENDER_INFO["phone"],
+            SENDER_INFO["country"], SENDER_INFO["state"],
+            SENDER_INFO["city"], SENDER_INFO["zip"], SENDER_INFO["address"],
+            recip["name"], None, recip["phone"], "US",
+            state_to_abbr(recip["state"]), recip["city"],
+            recip["street"], recip["street2"] or None, recip["zip"],
+            PACKAGE_DEFAULTS["cn_name"], PACKAGE_DEFAULTS["en_name"],
+            None, PACKAGE_DEFAULTS["qty"], None,
+            PACKAGE_DEFAULTS["declare_price"], PACKAGE_DEFAULTS["net_weight"],
+        ])
+    return _write_shuidan_workbook(rows_data)
+
+
+def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
+    """
+    Return Label 水单：顾客 / 达人 寄回给 NailVesta
+      - 发件人 = 顾客 或 达人（自动识别）
+      - 收件人 = NailVesta
+    深度达人形态：从"地址"列 + "达人Name"提取（无电话）
+    普通客户形态：从 Shipping Info 解析（有电话）
+    """
+    rows_data = []
+    for _, r in orders.iterrows():
+        # get_recipient_info 已经处理两种形态：
+        #   - 深度达人：用 地址 + 达人Name，电话留空
+        #   - 普通客户：用 Shipping Info，电话用顾客电话
+        sender = get_recipient_info(r)
+        rows_data.append([
+            r["Order ID"], None,
+            PACKAGE_DEFAULTS["weight"], PACKAGE_DEFAULTS["length"],
+            PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
+            # 发件人 = 顾客/达人
+            sender["name"], None, sender["phone"],
+            "US", state_to_abbr(sender["state"]),
+            sender["city"], sender["zip"], sender["street"],
+            # 收件人 = NailVesta
+            SENDER_INFO["name"], None, SENDER_INFO["phone"], "US",
+            SENDER_INFO["state"], SENDER_INFO["city"],
+            SENDER_INFO["address"], None, SENDER_INFO["zip"],
+            PACKAGE_DEFAULTS["cn_name"], PACKAGE_DEFAULTS["en_name"],
+            None, PACKAGE_DEFAULTS["qty"], None,
+            PACKAGE_DEFAULTS["declare_price"], PACKAGE_DEFAULTS["net_weight"],
+        ])
+    return _write_shuidan_workbook(rows_data)
+
+
 # ============================================================
-# Label PDF OCR & 核对
+# Label PDF OCR & 核对（保持原样）
 # ============================================================
 def check_ocr_available() -> tuple:
-    """检查 tesseract + poppler 可用"""
     has_tess = subprocess.run(["which","tesseract"], capture_output=True).returncode == 0
     has_popp = subprocess.run(["which","pdftoppm"], capture_output=True).returncode == 0
     return has_tess, has_popp
 
 
 def parse_label_pdf(pdf_bytes: bytes) -> list:
-    """对 PDF 每一页 OCR，返回 list of dict: {page, order_id, tracking, name, address_lines, raw_text}"""
     has_tess, has_popp = check_ocr_available()
     if not (has_tess and has_popp):
-        raise RuntimeError("OCR 工具未安装：需要 tesseract + poppler-utils（在 packages.txt 中声明）")
+        raise RuntimeError("OCR 工具未安装：需要 tesseract + poppler-utils")
 
     with tempfile.TemporaryDirectory() as tmp:
         pdf_path = os.path.join(tmp, "labels.pdf")
         with open(pdf_path, "wb") as f:
             f.write(pdf_bytes)
-        # 渲染所有页为 jpg
         subprocess.run(
             ["pdftoppm", "-jpeg", "-r", "200", pdf_path, os.path.join(tmp, "lbl")],
             capture_output=True, timeout=120,
@@ -687,12 +702,10 @@ def parse_label_pdf(pdf_bytes: bytes) -> list:
 
 
 def _parse_label_text(text: str, page: int) -> dict:
-    """从 OCR 文本提取关键字段"""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     info = {"page": page, "order_id": "", "tracking": "",
             "name": "", "address_lines": [], "raw_text": text}
 
-    # Order ID：从下往上找 17+ 位纯数字（去空格后）
     for ln in reversed(lines):
         digits = re.sub(r"\s", "", ln)
         m = re.match(r"^(\d{17,20})(-\d+)?$", digits)
@@ -700,13 +713,11 @@ def _parse_label_text(text: str, page: int) -> dict:
             info["order_id"] = digits
             break
 
-    # Tracking
     for ln in lines:
         if re.search(r"9\d{3}\s+\d{4}\s+\d{4}\s+\d{4}", ln):
             info["tracking"] = re.sub(r"\s+", "", ln)
             break
 
-    # 收件人 + 地址
     in_addr = False
     for ln in lines:
         if "LOS ANGELES" in ln.upper() and "CA" in ln.upper():
@@ -725,12 +736,6 @@ def _parse_label_text(text: str, page: int) -> dict:
 
 
 def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
-    """
-    把 OCR 的 Label 结果与 Lark 订单核对
-    返回每单的核对结果 DataFrame:
-      Order ID / 状态 / 收件人 (Lark) / 收件人 (Label) / 城市 (Label) / Tracking / 备注
-    """
-    # 按 Order ID 索引（去除 -N 后缀）
     label_by_oid = {}
     for lbl in labels:
         oid = lbl["order_id"]
@@ -756,22 +761,18 @@ def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
             })
             continue
 
-        # 名字模糊匹配（去标点、空格、转大写）
         def norm(s): return re.sub(r"[^A-Z0-9]", "", s.upper()) if s else ""
         lark_n = norm(lark_name); lbl_n = norm(lbl["name"])
-        # 检查 Label 的最末地址行是否含 Lark 的 ZIP
         last_line = lbl["address_lines"][-1] if lbl["address_lines"] else ""
         zip_in_label = lark_zip and lark_zip in last_line
 
-        # 名字相似度（包含关系即视为通过）
         name_match = lark_n and lbl_n and (
             lark_n in lbl_n or lbl_n in lark_n
             or _ratio(lark_n, lbl_n) >= 0.7
         )
 
         if name_match and zip_in_label:
-            status = "✅ 一致"
-            note = ""
+            status = "✅ 一致"; note = ""
         elif name_match:
             status = "⚠️ 名字一致但邮编对不上"
             note = f"Lark={lark_zip} | Label={last_line}"
@@ -789,7 +790,6 @@ def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
             "Tracking": lbl["tracking"], "备注": note,
         })
 
-    # 反向：Label 里有但 Lark 里没有的
     lark_oids = set(str(o).strip() for o in orders["Order ID"])
     for oid_base, lbl in label_by_oid.items():
         if oid_base not in lark_oids:
@@ -805,10 +805,8 @@ def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
 
 
 def _ratio(a, b):
-    """简单的字符相似度（最长公共子序列长度 / 最长字符串长度）"""
     if not a or not b: return 0
     if a == b: return 1
-    # 简化版 LCS
     m, n = len(a), len(b)
     dp = [[0]*(n+1) for _ in range(m+1)]
     for i in range(1, m+1):
@@ -834,7 +832,9 @@ tab1, tab2 = st.tabs([
 # ============================================================
 with tab1:
     st.subheader("第 1 步 · 生成水单 Excel")
-    st.caption("上传 Lark CSV → 选日期 → 下载 2 个水单（深度达人单 + 客户单）→ 发给打 Label 的同事")
+    st.caption(
+        "上传 Lark CSV → 选日期 → 下载水单（深度达人 / 客户 / Return Label）→ 发给打 Label 的同事"
+    )
 
     lark_file_1 = st.file_uploader("Lark 水单 CSV", type=["csv"], key="lark1")
 
@@ -857,14 +857,19 @@ with tab1:
                 key="d1",
             )
             orders_1 = filter_orders_for_date(df1, sel_date_1)
+            split_1 = split_orders_by_type(orders_1)
+            kol_orders = split_1["kol"]
+            customer_orders = split_1["customer"]
+            return_kol_orders = split_1["return_label_kol"]
+            return_cust_orders = split_1["return_label_cust"]
+            return_total = len(return_kol_orders) + len(return_cust_orders)
 
-            kol_orders = orders_1[orders_1["客诉类型"] == "深度达人"].copy()
-            other_orders = orders_1[orders_1["客诉类型"] != "深度达人"].copy()
-
-            mc1, mc2, mc3 = st.columns(3)
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
             mc1.metric("当日总订单", len(orders_1))
             mc2.metric("深度达人单", len(kol_orders))
-            mc3.metric("客户单（其他类型）", len(other_orders))
+            mc3.metric("客户单", len(customer_orders))
+            mc4.metric("↩️ 退货达人", len(return_kol_orders))
+            mc5.metric("↩️ 退货客户", len(return_cust_orders))
 
             if len(orders_1) == 0:
                 st.warning(f"⚠️ {sel_date_1} 没有可发货订单")
@@ -877,15 +882,17 @@ with tab1:
                     )
 
                 with st.expander("👀 订单预览", expanded=False):
-                    preview_cols = ["Order ID", "客诉类型", "Product Name", "款式",
-                                    "Full SKU", SIZE_COL, "Size", "达人Name", "地址", "Shipping Info"]
+                    preview_cols = ["Order ID", "客诉类型", RETURN_LABEL_COL,
+                                    "Product Name", "款式",
+                                    "Full SKU", SIZE_COL, "Size",
+                                    "达人Name", "地址", "Shipping Info"]
                     preview = orders_1[[c for c in preview_cols if c in orders_1.columns]]
                     st.dataframe(preview, use_container_width=True, height=300)
 
                 date_compact = sel_date_1.replace("/", "")
 
                 st.divider()
-                st.markdown("### 📥 下载水单文件")
+                st.markdown("### 📥 下载水单文件（正常发货）")
 
                 col_kol, col_other = st.columns(2)
 
@@ -904,22 +911,87 @@ with tab1:
                         )
 
                 with col_other:
-                    st.markdown("#### 📦 客户水单（其他类型）")
-                    if len(other_orders) == 0:
+                    st.markdown("#### 📦 客户水单")
+                    if len(customer_orders) == 0:
                         st.info("今日无客户单")
                     else:
-                        other_xlsx = build_shuidan_xlsx(other_orders)
+                        other_xlsx = build_shuidan_xlsx(customer_orders)
                         st.download_button(
-                            f"📦 下载客户水单（{len(other_orders)} 单）",
+                            f"📦 下载客户水单（{len(customer_orders)} 单）",
                             data=other_xlsx,
                             file_name=f"{date_compact}客人水单.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             type="primary", use_container_width=True, key="dl_other",
                         )
 
+                # —— Return Label 单独区域 ——
+                st.divider()
+                st.markdown("### ↩️ Return Label 包裹（顾客/达人寄回）")
+                st.caption(
+                    "**这些是寄回给我们的包裹**：发件人 = 顾客/达人，收件人 = NailVesta。"
+                    "和上面的正常水单分开处理 ⚠️"
+                )
+
+                if return_total == 0:
+                    st.info("今日无 Return Label 包裹 ✅")
+                else:
+                    col_ret_kol, col_ret_cust = st.columns(2)
+
+                    with col_ret_kol:
+                        st.markdown("#### 🌟 退货 · 深度达人")
+                        if len(return_kol_orders) == 0:
+                            st.info("今日无深度达人退货")
+                        else:
+                            with st.expander(
+                                f"👀 查看 {len(return_kol_orders)} 单详情",
+                                expanded=False,
+                            ):
+                                ret_kol_cols = ["Order ID", "客诉类型", "款式",
+                                                "达人Name", "地址"]
+                                ret_kol_preview = return_kol_orders[
+                                    [c for c in ret_kol_cols if c in return_kol_orders.columns]
+                                ]
+                                st.dataframe(ret_kol_preview, use_container_width=True,
+                                             height=200)
+                            ret_kol_xlsx = build_return_label_xlsx(return_kol_orders)
+                            st.download_button(
+                                f"↩️ 下载深度达人退货水单（{len(return_kol_orders)} 单）",
+                                data=ret_kol_xlsx,
+                                file_name=f"{date_compact}Return_Label_深度达人水单.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                type="primary", use_container_width=True,
+                                key="dl_return_kol",
+                            )
+
+                    with col_ret_cust:
+                        st.markdown("#### 📦 退货 · 客户")
+                        if len(return_cust_orders) == 0:
+                            st.info("今日无客户退货")
+                        else:
+                            with st.expander(
+                                f"👀 查看 {len(return_cust_orders)} 单详情",
+                                expanded=False,
+                            ):
+                                ret_cust_cols = ["Order ID", "客诉类型", "Product Name",
+                                                 "Shipping Info"]
+                                ret_cust_preview = return_cust_orders[
+                                    [c for c in ret_cust_cols if c in return_cust_orders.columns]
+                                ]
+                                st.dataframe(ret_cust_preview, use_container_width=True,
+                                             height=200)
+                            ret_cust_xlsx = build_return_label_xlsx(return_cust_orders)
+                            st.download_button(
+                                f"↩️ 下载客户退货水单（{len(return_cust_orders)} 单）",
+                                data=ret_cust_xlsx,
+                                file_name=f"{date_compact}Return_Label_客人水单.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                type="primary", use_container_width=True,
+                                key="dl_return_cust",
+                            )
+
                 st.caption(
                     "💡 已强制邮编/电话/Order ID 为文本格式，"
-                    "Excel 打开不会丢失前导零（如 03867）或 Order ID 转科学计数法"
+                    "Excel 打开不会丢失前导零或 Order ID 转科学计数法"
                 )
 
 # ============================================================
@@ -927,7 +999,10 @@ with tab1:
 # ============================================================
 with tab2:
     st.subheader("第 2 步 · 核对面单 + 生成拣货单/发货单")
-    st.caption("上传 Lark CSV + 图册 + Label PDF → 自动核对 + 生成拣货单/发货单")
+    st.caption(
+        "上传 Lark CSV + 图册 + Label PDF → 自动核对 + 生成拣货单/发货单"
+        "（**Return Label 包裹会自动排除，因为是顾客寄回给我们的，不需要拣货**）"
+    )
 
     c_left, c_right = st.columns(2)
     with c_left:
@@ -957,17 +1032,32 @@ with tab2:
         format_func=lambda x: f"{x} {'⬅️ 最新' if x == all_dates_2[0] else ''}",
         key="d2",
     )
-    orders_2 = filter_orders_for_date(df2, sel_date_2)
+    orders_2_all = filter_orders_for_date(df2, sel_date_2)
+
+    # 关键：拣货阶段排除所有 Return Label 单（顾客/达人寄回，不需要我们打包发货）
+    split_2 = split_orders_by_type(orders_2_all)
+    return_count_2 = len(split_2["return_label_kol"]) + len(split_2["return_label_cust"])
+    orders_2 = pd.concat([split_2["kol"], split_2["customer"]], ignore_index=False)
+
+    if return_count_2 > 0:
+        st.info(
+            f"ℹ️ 已自动排除 {return_count_2} 单 Return Label 包裹"
+            f"（{len(split_2['return_label_kol'])} 深度达人 + "
+            f"{len(split_2['return_label_cust'])} 客户，寄回不需要我们拣货）"
+        )
+
     exploded_2 = explode_orders(orders_2, catalog2)
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("订单数", len(orders_2))
+    m1.metric("待发货订单", len(orders_2))
     m2.metric("拣货行数", len(exploded_2),
-              delta=f"+{len(exploded_2)-len(orders_2)} 组合装" if len(exploded_2) > len(orders_2) else None)
-    m3.metric("拣货库位", exploded_2["库位"].replace("", pd.NA).dropna().nunique() if len(exploded_2) else 0)
+              delta=f"+{len(exploded_2)-len(orders_2)} 组合装"
+                    if len(exploded_2) > len(orders_2) else None)
+    m3.metric("拣货库位",
+              exploded_2["库位"].replace("", pd.NA).dropna().nunique() if len(exploded_2) else 0)
 
     if len(orders_2) == 0:
-        st.warning(f"⚠️ {sel_date_2} 没有可发货订单")
+        st.warning(f"⚠️ {sel_date_2} 没有需要拣货的订单")
         st.stop()
 
     # ---- 面单核对 ----
@@ -991,7 +1081,6 @@ with tab2:
                     rec = None
 
             if rec is not None:
-                # 统计
                 ok = (rec["状态"] == "✅ 一致").sum()
                 warn = rec["状态"].str.startswith("⚠️").sum()
                 bad = rec["状态"].str.startswith("❌").sum()
@@ -1000,7 +1089,6 @@ with tab2:
                 cc2.metric("⚠️ 警告", warn)
                 cc3.metric("❌ 不一致", bad)
 
-                # 高亮表格
                 def color_status(val):
                     if val.startswith("✅"): return "background-color: #d4edda"
                     if val.startswith("⚠️"): return "background-color: #fff3cd"
