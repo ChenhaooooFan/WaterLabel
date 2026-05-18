@@ -8,9 +8,13 @@ NailVesta 发货系统（两阶段工作流）
       - 客户水单     (NailVesta 发出, 寄给客户)
       - Return Label 包裹 (顾客寄回, 顾客=发件人, NailVesta=收件人)
 
+    重要逻辑：
+      如果 Return Label 包裹列打勾，这一行仍然需要生成一张「正常发货水单」；
+      同时额外生成一张「Return Label 水单」。也就是同一行会产出 2 张 label 需求。
+
 阶段 2（拣货 + 发货 + 核对）:
     Lark CSV + 图册 CSV + Label PDF → OCR 核对 + 生成拣货单/发货单
-    Return Label 包裹不参与拣货核对（顾客寄回，无需我们打包）
+    Return Label 勾选订单仍参与正常发货拣货；顾客寄回给我们的 Return Label 本身不参与拣货。
 """
 
 import io
@@ -346,12 +350,17 @@ def filter_orders_for_date(df, target_date):
 
 def split_orders_by_type(orders: pd.DataFrame) -> dict:
     """
-    把当日订单分成 4 类:
-      - kol:               正常发出的深度达人单 (NailVesta → 达人)
-      - customer:          正常发出的客户单    (NailVesta → 客户)
-      - return_label_kol:  Return Label + 深度达人形态 (达人 → NailVesta 寄回)
-      - return_label_cust: Return Label + 客户形态     (客户 → NailVesta 寄回)
-    深度达人形态判断：客诉类型 == "深度达人"
+    把当日订单分成 4 类。
+
+    关键业务逻辑：
+      Return Label 包裹列打勾 ≠ 不需要正常发货。
+      打勾表示：
+        1) 这行订单照常生成正常发货水单 / 参与拣货；
+        2) 同时额外生成一张 Return Label 水单（顾客/达人 → NailVesta）。
+
+    所以：
+      - kol/customer 包含所有正常发货订单，包括 Return Label 打勾的行；
+      - return_label_kol/return_label_cust 是额外抽出来生成寄回 label 的子集。
     """
     if RETURN_LABEL_COL in orders.columns:
         is_ret = orders[RETURN_LABEL_COL].apply(is_return_label)
@@ -361,8 +370,10 @@ def split_orders_by_type(orders: pd.DataFrame) -> dict:
     is_kol = orders["客诉类型"] == "深度达人"
 
     return {
-        "kol":               orders[~is_ret &  is_kol].copy(),
-        "customer":          orders[~is_ret & ~is_kol].copy(),
+        # 正常发货水单：不再排除 Return Label 勾选订单
+        "kol":               orders[ is_kol].copy(),
+        "customer":          orders[~is_kol].copy(),
+        # 额外 Return Label 水单：只取打勾子集
         "return_label_kol":  orders[ is_ret &  is_kol].copy(),
         "return_label_cust": orders[ is_ret & ~is_kol].copy(),
     }
@@ -833,7 +844,7 @@ tab1, tab2 = st.tabs([
 with tab1:
     st.subheader("第 1 步 · 生成水单 Excel")
     st.caption(
-        "上传 Lark CSV → 选日期 → 下载水单（深度达人 / 客户 / Return Label）→ 发给打 Label 的同事"
+        "上传 Lark CSV → 选日期 → 下载水单（正常发货 + 额外 Return Label）→ 发给打 Label 的同事"
     )
 
     lark_file_1 = st.file_uploader("Lark 水单 CSV", type=["csv"], key="lark1")
@@ -928,8 +939,8 @@ with tab1:
                 st.divider()
                 st.markdown("### ↩️ Return Label 包裹（顾客/达人寄回）")
                 st.caption(
-                    "**这些是寄回给我们的包裹**：发件人 = 顾客/达人，收件人 = NailVesta。"
-                    "和上面的正常水单分开处理 ⚠️"
+                    "**这些是额外生成的寄回包裹 label**：发件人 = 顾客/达人，收件人 = NailVesta。"
+                    "Return Label 打勾的订单仍然已经包含在上面的正常发货水单里；这里是额外再生成一张寄回 label ⚠️"
                 )
 
                 if return_total == 0:
@@ -1000,8 +1011,9 @@ with tab1:
 with tab2:
     st.subheader("第 2 步 · 核对面单 + 生成拣货单/发货单")
     st.caption(
-        "上传 Lark CSV + 图册 + Label PDF → 自动核对 + 生成拣货单/发货单"
-        "（**Return Label 包裹会自动排除，因为是顾客寄回给我们的，不需要拣货**）"
+        "上传 Lark CSV + 图册 + Label PDF → 自动核对 + 生成拣货单/发货单。"
+        "Return Label 勾选订单仍参与正常发货拣货；寄回给我们的 Return Label 本身不需要拣货。"
+        "面单核对建议只上传正常发货 Label PDF，不要把寄回 Return Label PDF 混在一起。"
     )
 
     c_left, c_right = st.columns(2)
@@ -1034,16 +1046,18 @@ with tab2:
     )
     orders_2_all = filter_orders_for_date(df2, sel_date_2)
 
-    # 关键：拣货阶段排除所有 Return Label 单（顾客/达人寄回，不需要我们打包发货）
+    # 关键：Return Label 打勾的订单仍然要正常发货，因此不能从拣货/发货里排除。
+    # split_orders_by_type 里的 kol/customer 已经包含 Return Label 打勾订单。
     split_2 = split_orders_by_type(orders_2_all)
     return_count_2 = len(split_2["return_label_kol"]) + len(split_2["return_label_cust"])
     orders_2 = pd.concat([split_2["kol"], split_2["customer"]], ignore_index=False)
 
     if return_count_2 > 0:
         st.info(
-            f"ℹ️ 已自动排除 {return_count_2} 单 Return Label 包裹"
+            f"ℹ️ 已保留 {return_count_2} 单 Return Label 勾选订单参与正常发货拣货"
             f"（{len(split_2['return_label_kol'])} 深度达人 + "
-            f"{len(split_2['return_label_cust'])} 客户，寄回不需要我们拣货）"
+            f"{len(split_2['return_label_cust'])} 客户）。"
+            "寄回给我们的 Return Label 本身不需要拣货；面单核对请上传正常发货 Label PDF。"
         )
 
     exploded_2 = explode_orders(orders_2, catalog2)
