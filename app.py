@@ -244,62 +244,209 @@ def parse_free_address(text: str) -> dict:
     }
 
 
+
+def _state_from_segment(seg: str):
+    """
+    从一个逗号分段里识别州。
+    返回 (州名前面的城市文本, 州缩写)，例如：
+      "Texas" -> ("", "TX")
+      "Ann Arbor michigan" -> ("Ann Arbor", "MI")
+      "CA" -> ("", "CA")
+    注意：这里故意只识别“整段就是州”或“州在分段末尾”，避免把
+    Missouri City 误判成 MO。
+    """
+    original = str(seg or "").strip(" ,")
+    if not original:
+        return None
+    upper = original.upper().replace(".", "")
+
+    if upper in _STATE_ABBR:
+        return "", upper
+    if upper in _STATE_FULL_TO_ABBR:
+        return "", _STATE_FULL_TO_ABBR[upper]
+
+    # 全称州名，按长度倒序，避免 NEW YORK / YORK 这类误判
+    for full, abbr in sorted(_STATE_FULL_TO_ABBR.items(), key=lambda x: -len(x[0])):
+        m = re.search(r"(?:^|\s)" + re.escape(full) + r"$", upper)
+        if m:
+            before = original[:m.start()].strip(" ,")
+            return before, abbr
+
+    # 两位州缩写在分段末尾
+    m = re.search(r"(?:^|\s)([A-Z]{2})$", upper)
+    if m and m.group(1) in _STATE_ABBR:
+        before = original[:m.start()].strip(" ,")
+        return before, m.group(1)
+
+    return None
+
+
+def _split_address_components(addr_lines: list, zip_code: str = "") -> dict:
+    """
+    把 phone 后面的地址行解析成 street / street2 / city / state / zip。
+    兼容 Lark 里常见的三种 Shipping Info：
+      1) Street + City,State,United States + Zip
+      2) Street, City, ST Zip
+      3) Street, City State, United States + Zip
+    """
+    info = {
+        "street": "", "street2": "", "city": "", "state": "",
+        "country": "United States", "zip": zip_code or "",
+    }
+
+    cleaned = []
+    for ln in addr_lines:
+        if not ln:
+            continue
+        t = str(ln).strip()
+        if re.fullmatch(r"(?i)(United States|USA|US)", t.strip(" ,")):
+            continue
+        if _is_zip(t):
+            continue
+        cleaned.append(t)
+
+    combined = ", ".join(cleaned)
+    combined = re.sub(r"\b(United States|USA|US)\b", "", combined, flags=re.I)
+
+    # zip 可能是单独一行，也可能混在同一行地址里
+    zips = list(re.finditer(r"\b(\d{5})(?:-\d{4})?\b", combined))
+    if zips:
+        info["zip"] = zips[-1].group(1)
+        combined = re.sub(r"\b\d{5}(?:-\d{4})?\b", "", combined).strip(" ,")
+
+    parts = [p.strip() for p in combined.split(",") if p.strip()]
+
+    # 从后往前找州；这样 "Missouri City,Texas" 会识别成 TX，而不是 MO
+    state_part_idx = None
+    city_in_state_part = ""
+    state_abbr = ""
+    for idx in range(len(parts) - 1, -1, -1):
+        cand = _state_from_segment(parts[idx])
+        if cand:
+            city_in_state_part, state_abbr = cand
+            state_part_idx = idx
+            break
+
+    if state_part_idx is not None:
+        info["state"] = state_abbr
+        trailing_parts = parts[state_part_idx + 1:]
+
+        if city_in_state_part:
+            # 例如："3020 cloverly lane, Ann Arbor michigan"
+            info["city"] = city_in_state_part
+            street_parts = parts[:state_part_idx]
+        else:
+            # 例如："4100 N Marine Dr, Chicago, IL"
+            if state_part_idx - 1 >= 0:
+                info["city"] = parts[state_part_idx - 1]
+                street_parts = parts[:state_part_idx - 1]
+            else:
+                street_parts = []
+
+        if street_parts:
+            info["street"] = _clean_street(", ".join(street_parts))
+        if trailing_parts:
+            # 例如 zip 后面的 #221 / Apt 这类内容
+            info["street2"] = _clean_street(" ".join(trailing_parts))
+        return info
+
+    # 兜底：实在拆不出 city/state，也不要把姓名/国家塞进地址
+    if cleaned:
+        info["street"] = _clean_street(cleaned[0])
+        if len(cleaned) > 1:
+            info["street2"] = _clean_street(" ".join(cleaned[1:]))
+    return info
+
+
 def parse_shipping_info(text):
-    if not isinstance(text, str): return {}
-    lines = [ln.strip() for ln in text.replace("\r","").split("\n") if ln.strip()]
+    """
+    解析 Lark 的 Shipping Info。
+
+    这版修复了旧逻辑的几个问题：
+      - 姓名里带数字/逗号时，不再被跳过，例如 KDot1920 H. / Alan Holsztynski,
+      - 地址不是标准 City,State,United States 三段时，也能解析；
+      - 单行地址 Street, City, ST Zip 也能拆出 city/state/zip；
+      - 不会把 United States 当成收件人姓名；
+      - 不会把 Missouri City 误判成 MO。
+    """
+    if not isinstance(text, str):
+        return {}
+
+    lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
     while lines and re.search(r"[\u4e00-\u9fff]", lines[0]) and len(lines[0]) > 15:
         lines.pop(0)
-    if not lines: return {}
-    info = {"name":"","phone":"","street":"","street2":"",
-            "city":"","state":"","country":"United States","zip":""}
+    if not lines:
+        return {}
+
+    info = {
+        "name": "", "phone": "", "street": "", "street2": "",
+        "city": "", "state": "", "country": "United States", "zip": "",
+    }
+
+    # zip：优先找单独一行，找不到就从整段文字里抓最后一个 5 位 zip
     zip_idx = None
-    for i in range(len(lines)-1,-1,-1):
+    for i in range(len(lines) - 1, -1, -1):
         if _is_zip(lines[i]):
-            zip_idx = i; info["zip"] = lines[i].strip(); break
+            zip_idx = i
+            info["zip"] = lines[i].strip()[:5]
+            break
+    if not info["zip"]:
+        zip_matches = list(re.finditer(r"\b(\d{5})(?:-\d{4})?\b", text))
+        if zip_matches:
+            info["zip"] = zip_matches[-1].group(1)
+
+    # phone
     phone_idx = None
     for i, ln in enumerate(lines):
-        if i == zip_idx: continue
+        if i == zip_idx:
+            continue
         if _is_phone_line(ln):
-            info["phone"] = _clean_phone(ln); phone_idx = i; break
-    csc_idx = None
-    for i, ln in enumerate(lines):
-        if i in (zip_idx, phone_idx): continue
-        if "," in ln:
-            parts = [p.strip() for p in ln.split(",")]
-            if (any("UNITED STATES" in p.upper() or "USA" in p.upper() for p in parts)
-                    and len(parts) >= 3):
-                st_ = _normalize_state(parts[-2])
-                if st_:
-                    info["state"] = st_; info["country"] = parts[-1]
-                    head = parts[0]; csc_idx = i
-                    has_digit = bool(re.search(r"\d", head))
-                    m = re.match(r"^(.*?)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*$", head)
-                    if has_digit and m and re.search(r"\d", m.group(1)):
-                        info["street"] = m.group(1).strip()
-                        info["city"] = m.group(2).strip()
-                    else:
-                        info["city"] = head
-                    break
-    used = {zip_idx, phone_idx, csc_idx}
-    others = [(i, lines[i]) for i in range(len(lines)) if i not in used]
-    name_pos = None
-    for k, (i, ln) in enumerate(others):
-        clean = re.sub(r"^Name\s*[:\uff1a]\s*", "", ln, flags=re.I)
-        if not re.search(r"\d", clean) and "," not in clean and ":" not in clean:
-            info["name"] = clean; name_pos = k; break
-    street_lines = [
-        re.sub(r"^(Address|Street|Apt|Suite)\s*[:\uff1a]\s*", "", ln, flags=re.I)
-        for k, (i, ln) in enumerate(others) if k != name_pos
-    ]
-    if not info["street"]:
-        if street_lines:
-            info["street"] = street_lines[0]
-            if len(street_lines) > 1:
-                info["street2"] = " ".join(street_lines[1:])
-    else:
-        if street_lines: info["street2"] = " ".join(street_lines)
-    info["street"] = _clean_street(info["street"])
-    info["street2"] = _clean_street(info["street2"]) if info["street2"] else ""
+            info["phone"] = _clean_phone(ln)
+            phone_idx = i
+            break
+
+    # name：通常就是 phone 前第一行。允许姓名里有数字/括号/尾随逗号。
+    if phone_idx is not None:
+        for i in range(phone_idx):
+            clean = re.sub(r"^Name\s*[:\uff1a]\s*", "", lines[i], flags=re.I).strip(" ,")
+            if (
+                clean
+                and not _is_phone_line(clean)
+                and not _is_zip(clean)
+                and not re.fullmatch(r"(?i)(United States|USA|US)", clean)
+            ):
+                info["name"] = clean
+                break
+
+    # fallback：没有识别到 phone 时，拿第一个不像电话/zip/国家的行做姓名
+    if not info["name"]:
+        for i, ln in enumerate(lines):
+            clean = str(ln).strip(" ,")
+            if i in (phone_idx, zip_idx):
+                continue
+            if (
+                clean
+                and not _is_phone_line(clean)
+                and not _is_zip(clean)
+                and not re.fullmatch(r"(?i)(United States|USA|US)", clean)
+            ):
+                info["name"] = clean
+                break
+
+    start = (phone_idx + 1) if phone_idx is not None else 1
+    addr_lines = []
+    for i in range(start, len(lines)):
+        if i == zip_idx:
+            continue
+        ln = re.sub(r"^(Address|Street|Apt|Suite)\s*[:\uff1a]\s*", "", lines[i], flags=re.I).strip()
+        if ln:
+            addr_lines.append(ln)
+
+    addr = _split_address_components(addr_lines, info["zip"])
+    info.update(addr)
+    info["state"] = state_to_abbr(info.get("state", ""))
+    info["street"] = _clean_street(info.get("street", ""))
+    info["street2"] = _clean_street(info.get("street2", "")) if info.get("street2") else ""
     return info
 
 
@@ -330,10 +477,20 @@ def filter_orders_for_date(df, target_date):
     筛选当日可发货订单。包括两种类型：
     A) 普通订单（客诉/退换货/中差评等）：必须有 Order ID + Shipping Info
     B) 深度达人订单：客诉类型为"深度达人"，没有 Order ID，但有"地址"和"达人Name"
+
+    兼容不同 Lark View 导出的 CSV：有些“普通水单”导出不会包含 地址 / 达人Name / Handle 等达人字段，
+    这里不能直接 df["地址"]，否则会 KeyError。
     """
     is_date = df["日期"] == target_date
-    type_a = is_date & df["Order ID"].notna() & df["Shipping Info"].notna()
-    type_b = is_date & (df["客诉类型"] == "深度达人") & df["地址"].notna() & df["达人Name"].notna()
+    has_order_id = df["Order ID"].notna() if "Order ID" in df.columns else pd.Series([False] * len(df), index=df.index)
+    has_shipping = df["Shipping Info"].notna() if "Shipping Info" in df.columns else pd.Series([False] * len(df), index=df.index)
+    type_a = is_date & has_order_id & has_shipping
+
+    is_deep_kol = (df["客诉类型"] == "深度达人") if "客诉类型" in df.columns else pd.Series([False] * len(df), index=df.index)
+    has_addr = df["地址"].notna() if "地址" in df.columns else pd.Series([False] * len(df), index=df.index)
+    has_kol_name = df["达人Name"].notna() if "达人Name" in df.columns else pd.Series([False] * len(df), index=df.index)
+    type_b = is_date & is_deep_kol & has_addr & has_kol_name
+
     out = df[type_a | type_b].copy()
 
     def make_id(r):
