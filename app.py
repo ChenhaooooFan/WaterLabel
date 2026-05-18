@@ -564,6 +564,135 @@ def get_recipient_info(row) -> dict:
 
 
 # ============================================================
+# 地址完整性校验
+# ============================================================
+def _is_blank_value(v) -> bool:
+    """判断字段是否为空；兼容 NaN / None / 空字符串。"""
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except Exception:
+        pass
+    s = str(v).strip()
+    return s == "" or s.lower() in {"nan", "none", "null"}
+
+
+def _valid_us_zip(v) -> bool:
+    if _is_blank_value(v):
+        return False
+    return bool(re.fullmatch(r"\d{5}(-\d{4})?", str(v).strip()))
+
+
+def _valid_us_state(v) -> bool:
+    if _is_blank_value(v):
+        return False
+    return state_to_abbr(str(v).strip()).upper() in _STATE_ABBR
+
+
+def _format_original_address(row) -> str:
+    """给异常报告用：展示原始地址来源。"""
+    if is_kol_order(row):
+        return str(row.get("地址", "") or "").strip()
+    return str(row.get("Shipping Info", "") or "").strip()
+
+
+def validate_address_info(row, label_kind: str = "正常发货") -> list:
+    """
+    校验一行订单解析出来的姓名/电话/地址是否足够生成 Label。
+
+    label_kind:
+      - 正常发货：NailVesta → 顾客/达人，校验对象是收件人
+      - Return Label：顾客/达人 → NailVesta，校验对象是发件人
+
+    返回 issue list，每个 issue 是一个 dict；无问题返回空 list。
+    """
+    info = get_recipient_info(row)
+    role = "收件人" if label_kind == "正常发货" else "发件人"
+    issues = []
+
+    def add_issue(field, message, level="严重"):
+        issues.append({
+            "影响Label": label_kind,
+            "对象": role,
+            "订单号": str(row.get("Order ID", "") or "").strip(),
+            "客诉类型": str(row.get("客诉类型", "") or "").strip(),
+            "问题等级": level,
+            "问题字段": field,
+            "问题说明": message,
+            "解析姓名": str(info.get("name", "") or "").strip(),
+            "解析电话": str(info.get("phone", "") or "").strip(),
+            "解析地址一": str(info.get("street", "") or "").strip(),
+            "解析地址二": str(info.get("street2", "") or "").strip(),
+            "解析城市": str(info.get("city", "") or "").strip(),
+            "解析州": state_to_abbr(str(info.get("state", "") or "").strip()),
+            "解析邮编": str(info.get("zip", "") or "").strip(),
+            "原始地址信息": _format_original_address(row),
+        })
+
+    raw_addr = _format_original_address(row)
+    if _is_blank_value(raw_addr):
+        add_issue("原始地址", "原始地址信息为空，无法生成可用 Label")
+        return issues
+
+    if _is_blank_value(info.get("name")):
+        add_issue(f"{role}姓名", f"{role}姓名缺失或没有被程序识别出来")
+
+    # 客户单必须有电话；深度达人历史数据经常没有电话，所以先标成提醒，不阻断。
+    phone = str(info.get("phone", "") or "").strip()
+    if _is_blank_value(phone):
+        if is_kol_order(row):
+            add_issue(f"{role}电话", f"{role}电话缺失；深度达人单可人工确认是否允许为空", level="提醒")
+        else:
+            add_issue(f"{role}电话", f"{role}电话缺失")
+    elif not re.fullmatch(r"\d{10}", phone):
+        add_issue(f"{role}电话", f"{role}电话格式异常：{phone}，建议为 10 位美国电话", level="提醒")
+
+    if _is_blank_value(info.get("street")):
+        add_issue(f"{role}地址一", f"{role}街道地址 Address 1 缺失")
+    if _is_blank_value(info.get("city")):
+        add_issue(f"{role}城市", f"{role}城市 City 缺失或没有被程序识别出来")
+
+    state = str(info.get("state", "") or "").strip()
+    if _is_blank_value(state):
+        add_issue(f"{role}州", f"{role}州 State 缺失或没有被程序识别出来")
+    elif not _valid_us_state(state):
+        add_issue(f"{role}州", f"{role}州 State 格式异常：{state}，应为美国州缩写或州全称")
+
+    zip_code = str(info.get("zip", "") or "").strip()
+    if _is_blank_value(zip_code):
+        add_issue(f"{role}邮编", f"{role}邮编 Zip Code 缺失或没有被程序识别出来")
+    elif not _valid_us_zip(zip_code):
+        add_issue(f"{role}邮编", f"{role}邮编 Zip Code 格式异常：{zip_code}，应为 5 位或 ZIP+4")
+
+    # 明显把国家/地址行误识别成姓名时，额外提示。
+    if str(info.get("name", "") or "").strip().lower() in {"united states", "usa", "us"}:
+        add_issue(f"{role}姓名", f"{role}姓名被误识别为国家，请检查原始 Shipping Info")
+
+    return issues
+
+
+def build_address_issue_report(orders: pd.DataFrame, label_kind: str = "正常发货") -> pd.DataFrame:
+    """批量生成地址异常报告。"""
+    all_issues = []
+    if orders is None or len(orders) == 0:
+        return pd.DataFrame(columns=[
+            "影响Label", "对象", "订单号", "客诉类型", "问题等级", "问题字段",
+            "问题说明", "解析姓名", "解析电话", "解析地址一", "解析地址二",
+            "解析城市", "解析州", "解析邮编", "原始地址信息",
+        ])
+    for _, row in orders.iterrows():
+        all_issues.extend(validate_address_info(row, label_kind=label_kind))
+    return pd.DataFrame(all_issues)
+
+
+def address_report_csv(report: pd.DataFrame) -> bytes:
+    """异常报告导出 CSV。"""
+    return report.to_csv(index=False).encode("utf-8-sig")
+
+
+# ============================================================
 # 组合装拆单 + 图册富集
 # ============================================================
 def _parse_size(size_raw):
@@ -1058,6 +1187,48 @@ with tab1:
                     st.dataframe(preview, use_container_width=True, height=300)
 
                 date_compact = sel_date_1.replace("/", "")
+
+                # —— 地址完整性校验 ——
+                normal_orders_for_check = pd.concat([kol_orders, customer_orders], ignore_index=False)
+                normal_address_issues = build_address_issue_report(normal_orders_for_check, label_kind="正常发货")
+                return_address_issues = pd.concat([
+                    build_address_issue_report(return_kol_orders, label_kind="Return Label"),
+                    build_address_issue_report(return_cust_orders, label_kind="Return Label"),
+                ], ignore_index=True)
+                address_issues_all = pd.concat(
+                    [normal_address_issues, return_address_issues],
+                    ignore_index=True,
+                )
+
+                if len(address_issues_all) > 0:
+                    serious_cnt = (address_issues_all["问题等级"] == "严重").sum()
+                    remind_cnt = (address_issues_all["问题等级"] == "提醒").sum()
+                    st.warning(
+                        f"⚠️ 地址信息检查发现 {len(address_issues_all)} 条问题："
+                        f"{serious_cnt} 条严重 / {remind_cnt} 条提醒。"
+                        "建议先修正 Lark 水单表后再下载或上传水单。"
+                    )
+                    with st.expander("🚨 查看地址问题明细", expanded=True):
+                        show_cols = [
+                            "影响Label", "订单号", "客诉类型", "问题等级", "问题字段", "问题说明",
+                            "解析姓名", "解析电话", "解析地址一", "解析地址二",
+                            "解析城市", "解析州", "解析邮编", "原始地址信息",
+                        ]
+                        st.dataframe(
+                            address_issues_all[[c for c in show_cols if c in address_issues_all.columns]],
+                            use_container_width=True, height=320, hide_index=True,
+                        )
+                        st.download_button(
+                            f"📥 下载地址问题报告（{len(address_issues_all)} 条）",
+                            data=address_report_csv(address_issues_all),
+                            file_name=f"{date_compact}地址问题报告.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="dl_address_issues_tab1",
+                        )
+                else:
+                    st.success("✅ 地址信息检查通过：姓名 / 电话 / 地址 / 城市 / 州 / 邮编未发现明显缺失。")
+
 
                 st.divider()
                 st.markdown("### 📥 下载水单文件（正常发货）")
