@@ -100,7 +100,7 @@ def _is_zip(s): return bool(re.fullmatch(r"\d{5}(-\d{4})?", s.strip()))
 def _is_phone_line(s):
     if re.match(r"^[\sa]*\(?\+?1?\)?[\s\-\.]?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}", s.strip()):
         return True
-    return bool(re.match(r"^(Tel|Phone|WhatsApp)\s*[:\uff1a]", s.strip(), re.I))
+    return bool(re.match(r"^(Tel|Phone|WhatsApp)\s*[:：]", s.strip(), re.I))
 
 
 def _normalize_state(tok):
@@ -150,6 +150,8 @@ def parse_free_address(text: str) -> dict:
     """解析自由格式地址（深度达人单的"地址"字段是单行自由文本）"""
     if not isinstance(text, str): return {}
     s = text.strip().rstrip(",").strip()
+    # 全角标点转半角
+    s = s.replace("，", ",").replace("　", " ")
     s = re.sub(r"\s*\n\s*", " ", s)
     s = re.sub(r"\s+", " ", s)
 
@@ -252,7 +254,7 @@ def _state_from_segment(seg: str):
       "Texas" -> ("", "TX")
       "Ann Arbor michigan" -> ("Ann Arbor", "MI")
       "CA" -> ("", "CA")
-    注意：这里故意只识别“整段就是州”或“州在分段末尾”，避免把
+    注意：这里故意只识别"整段就是州"或"州在分段末尾"，避免把
     Missouri City 误判成 MO。
     """
     original = str(seg or "").strip(" ,")
@@ -311,8 +313,11 @@ def _split_address_components(addr_lines: list, zip_code: str = "") -> dict:
     # zip 可能是单独一行，也可能混在同一行地址里
     zips = list(re.finditer(r"\b(\d{5})(?:-\d{4})?\b", combined))
     if zips:
-        info["zip"] = zips[-1].group(1)
-        combined = re.sub(r"\b\d{5}(?:-\d{4})?\b", "", combined).strip(" ,")
+        zip_match = zips[-1]
+        if not info["zip"]:
+            info["zip"] = zip_match.group(1)
+        # ★ Fix: 只删除识别出的那一个邮编，不用全局替换（避免删掉5位门牌号如 11414）
+        combined = (combined[:zip_match.start()] + combined[zip_match.end():]).strip(" ,")
 
     parts = [p.strip() for p in combined.split(",") if p.strip()]
 
@@ -362,18 +367,20 @@ def parse_shipping_info(text):
     """
     解析 Lark 的 Shipping Info。
 
-    这版修复了旧逻辑的几个问题：
-      - 姓名里带数字/逗号时，不再被跳过，例如 KDot1920 H. / Alan Holsztynski,
-      - 地址不是标准 City,State,United States 三段时，也能解析；
-      - 单行地址 Street, City, ST Zip 也能拆出 city/state/zip；
-      - 不会把 United States 当成收件人姓名；
-      - 不会把 Missouri City 误判成 MO。
+    修复：
+      - 全角逗号 ，/ 全角空格 统一转半角，避免州缩写匹配失败
+      - phone 可能与 name、street 在同一行（Lark 导出用多个空格隔开），
+        改用 re.search 在整行里找 phone，并把 phone 后面的内容作为街道
+      - 只删除识别出的那一处邮编，不删掉所有5位数字（防止删门牌号）
     """
     if not isinstance(text, str):
         return {}
 
+    # ★ Fix 1: 全角标点转半角
+    text = text.replace("，", ",").replace("　", " ")
+
     lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
-    while lines and re.search(r"[\u4e00-\u9fff]", lines[0]) and len(lines[0]) > 15:
+    while lines and re.search(r"[一-鿿]", lines[0]) and len(lines[0]) > 15:
         lines.pop(0)
     if not lines:
         return {}
@@ -395,34 +402,48 @@ def parse_shipping_info(text):
         if zip_matches:
             info["zip"] = zip_matches[-1].group(1)
 
-    # phone
+    # ★ Fix 2: phone 用 re.search 在整行里找，兼容 name+phone+street 同行的 Lark 格式
+    _PHONE_RE = re.compile(
+        r'\(?\+?1?\)?[\s\-\.]?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}'
+    )
     phone_idx = None
+    phone_suffix = ""  # phone 所在行里 phone 之后的内容（可能是街道地址）
     for i, ln in enumerate(lines):
         if i == zip_idx:
             continue
-        if _is_phone_line(ln):
-            info["phone"] = _clean_phone(ln)
+        m = _PHONE_RE.search(ln)
+        if m:
+            info["phone"] = _clean_phone(m.group(0))
             phone_idx = i
+            after = ln[m.end():].strip(" ,\t")
+            if after:
+                phone_suffix = after  # 例如 "3926 HIghway 28E"
             break
 
-    # name：通常就是 phone 前第一行。允许姓名里有数字/括号/尾随逗号。
+    # name：phone 所在行里 phone 之前的部分，或 phone 前第一行
     if phone_idx is not None:
-        for i in range(phone_idx):
-            clean = re.sub(r"^Name\s*[:\uff1a]\s*", "", lines[i], flags=re.I).strip(" ,")
-            if (
-                clean
-                and not _is_phone_line(clean)
-                and not _is_zip(clean)
-                and not re.fullmatch(r"(?i)(United States|USA|US)", clean)
-            ):
-                info["name"] = clean
-                break
+        m = _PHONE_RE.search(lines[phone_idx])
+        before_phone = lines[phone_idx][:m.start()].strip(" ,") if m else ""
+        if before_phone and not re.fullmatch(r"(?i)(United States|USA|US)", before_phone):
+            info["name"] = before_phone
+        else:
+            # phone 前面还有单独的行
+            for i in range(phone_idx):
+                clean = re.sub(r"^Name\s*[:：]\s*", "", lines[i], flags=re.I).strip(" ,")
+                if (
+                    clean
+                    and not _is_phone_line(clean)
+                    and not _is_zip(clean)
+                    and not re.fullmatch(r"(?i)(United States|USA|US)", clean)
+                ):
+                    info["name"] = clean
+                    break
 
     # fallback：没有识别到 phone 时，拿第一个不像电话/zip/国家的行做姓名
     if not info["name"]:
         for i, ln in enumerate(lines):
             clean = str(ln).strip(" ,")
-            if i in (phone_idx, zip_idx):
+            if i in ([phone_idx] if phone_idx is not None else []) or i == zip_idx:
                 continue
             if (
                 clean
@@ -435,10 +456,13 @@ def parse_shipping_info(text):
 
     start = (phone_idx + 1) if phone_idx is not None else 1
     addr_lines = []
+    # ★ Fix 2: phone 后面同行的街道内容优先插入
+    if phone_suffix:
+        addr_lines.append(phone_suffix)
     for i in range(start, len(lines)):
         if i == zip_idx:
             continue
-        ln = re.sub(r"^(Address|Street|Apt|Suite)\s*[:\uff1a]\s*", "", lines[i], flags=re.I).strip()
+        ln = re.sub(r"^(Address|Street|Apt|Suite)\s*[:：]\s*", "", lines[i], flags=re.I).strip()
         if ln:
             addr_lines.append(ln)
 
@@ -478,7 +502,7 @@ def filter_orders_for_date(df, target_date):
     A) 普通订单（客诉/退换货/中差评等）：必须有 Order ID + Shipping Info
     B) 深度达人订单：客诉类型为"深度达人"，没有 Order ID，但有"地址"和"达人Name"
 
-    兼容不同 Lark View 导出的 CSV：有些“普通水单”导出不会包含 地址 / 达人Name / Handle 等达人字段，
+    兼容不同 Lark View 导出的 CSV：有些"普通水单"导出不会包含 地址 / 达人Name / Handle 等达人字段，
     这里不能直接 df["地址"]，否则会 KeyError。
     """
     is_date = df["日期"] == target_date
@@ -938,9 +962,6 @@ def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
     """
     rows_data = []
     for _, r in orders.iterrows():
-        # get_recipient_info 已经处理两种形态：
-        #   - 深度达人：用 地址 + 达人Name，电话留空
-        #   - 普通客户：用 Shipping Info，电话用顾客电话
         sender = get_recipient_info(r)
         rows_data.append([
             r["Order ID"], None,
@@ -1374,8 +1395,6 @@ with tab2:
     )
     orders_2_all = filter_orders_for_date(df2, sel_date_2)
 
-    # 关键：Return Label 打勾的订单仍然要正常发货，因此不能从拣货/发货里排除。
-    # split_orders_by_type 里的 kol/customer 已经包含 Return Label 打勾订单。
     split_2 = split_orders_by_type(orders_2_all)
     return_count_2 = len(split_2["return_label_kol"]) + len(split_2["return_label_cust"])
     orders_2 = pd.concat([split_2["kol"], split_2["customer"]], ignore_index=False)
