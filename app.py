@@ -311,13 +311,22 @@ def _split_address_components(addr_lines: list, zip_code: str = "") -> dict:
     combined = re.sub(r"\b(United States|USA|US)\b", "", combined, flags=re.I)
 
     # zip 可能是单独一行，也可能混在同一行地址里
+    # 关键：只删除真正是邮编的那个数字，不能删掉街道门牌号（如 12340 COPPERMINE RD 的 12340）
     zips = list(re.finditer(r"\b(\d{5})(?:-\d{4})?\b", combined))
     if zips:
-        zip_match = zips[-1]
-        if not info["zip"]:
+        zip_match = None
+        if info["zip"]:
+            # 已知邮编：只删除与已知邮编完全一致的那个 5 位数
+            for z in reversed(zips):
+                if z.group(1) == info["zip"]:
+                    zip_match = z
+                    break
+        if zip_match is None and not info["zip"]:
+            # 未知邮编：取最后一个 5 位数作为邮编
+            zip_match = zips[-1]
             info["zip"] = zip_match.group(1)
-        # ★ Fix: 只删除识别出的那一个邮编，不用全局替换（避免删掉5位门牌号如 11414）
-        combined = (combined[:zip_match.start()] + combined[zip_match.end():]).strip(" ,")
+        if zip_match is not None:
+            combined = (combined[:zip_match.start()] + combined[zip_match.end():]).strip(" ,")
 
     parts = [p.strip() for p in combined.split(",") if p.strip()]
 
