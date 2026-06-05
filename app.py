@@ -15,6 +15,14 @@ NailVesta 发货系统（两阶段工作流）
 阶段 2（拣货 + 发货 + 核对）:
     Lark CSV + 图册 CSV + Label PDF → OCR 核对 + 生成拣货单/发货单
     Return Label 勾选订单仍参与正常发货拣货；顾客寄回给我们的 Return Label 本身不参与拣货。
+
+========================================================
+【2026-06 修复】Order ID 乱码问题
+    根因：pd.read_csv 默认把 18 位 Order ID 推断为 float64，
+          超过浮点 ~15-16 位有效精度，末几位被截断，
+          导致同一订单在不同表里 Order ID 不一致。
+    修复：load_lark_data 中强制 Order ID / 电话 / Tracking 列为 str，
+          并统一清洗空值与 Handle 尾随空格。
 """
 
 import io
@@ -52,6 +60,12 @@ SHUIDAN_HEADERS = [
 ]
 SIZE_COL = "Size'"
 RETURN_LABEL_COL = "Return Label 包裹"
+
+# 需要强制按文本读取的列（防止长数字被读成 float 丢精度）
+TEXT_COLUMNS = [
+    "Order ID", "Phone", "手机号", "手机号 (1)",
+    "查物流 Tracking No.", "打包 Tracking No.",
+]
 
 # ============================================================
 # 地址解析
@@ -437,8 +451,29 @@ def parse_shipping_info(text):
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_lark_data(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes))
+    """
+    读取 Lark 导出的 CSV。
+
+    【关键】Order ID / 电话 / Tracking 等长数字列强制按 str 读取，
+    否则 pandas 会推断成 float64，18 位订单号超出浮点精度，
+    末几位被截断 → 同一订单在不同表里 Order ID 不一致（“乱”）。
+    """
+    df = pd.read_csv(
+        io.BytesIO(file_bytes),
+        dtype={col: str for col in TEXT_COLUMNS},
+        keep_default_na=True,
+    )
     df["日期"] = df["日期"].astype(str).str.strip()
+
+    # 统一清洗：去首尾空格 + 把字符串 "nan"/"none"/"null"/空串 归一为真正的缺失值
+    for col in TEXT_COLUMNS + ["Handle"]:
+        if col in df.columns:
+            df[col] = (
+                df[col].astype(str).str.strip()
+                .replace({"nan": "", "None": "", "null": "", "NaN": ""})
+            )
+            df[col] = df[col].replace("", pd.NA)
+
     return df
 
 
@@ -452,6 +487,19 @@ def load_catalog(file_bytes: bytes) -> pd.DataFrame:
     if "款式英文名称" in df.columns:
         df["款式英文名称"] = df["款式英文名称"].astype(str).str.strip()
     return df
+
+
+def _clean_str(v) -> str:
+    """统一把单元格转成干净字符串，过滤各种 nan 形态。"""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (ValueError, TypeError):
+        pass
+    s = str(v).strip()
+    return "" if s.lower() in {"nan", "none", "null"} else s
 
 
 def filter_orders_for_date(df, target_date):
@@ -481,12 +529,17 @@ def filter_orders_for_date(df, target_date):
     out = df[type_a | type_b].copy()
 
     def make_id(r):
-        oid = r["Order ID"]
-        if pd.notna(oid):
-            return str(int(oid)) if isinstance(oid, float) and float(oid).is_integer() else str(oid)
-        handle = str(r.get("Handle", "") or "").strip()
-        name = str(r.get("达人Name", "") or "").strip()
-        return f"KOL-{handle}" if handle and handle.lower() != "nan" else f"KOL-{name}"
+        # Order ID 现在一定是 str（或 NA），不再做 float→int 还原，避免精度丢失
+        oid = _clean_str(r.get("Order ID"))
+        if oid:
+            return oid
+        handle = _clean_str(r.get("Handle"))
+        name = _clean_str(r.get("达人Name"))
+        if handle:
+            return f"KOL-{handle}"
+        if name:
+            return f"KOL-{name}"
+        return "KOL-未知"
 
     out["Order ID"] = out.apply(make_id, axis=1)
     return out
@@ -509,23 +562,20 @@ def split_orders_by_type(orders: pd.DataFrame) -> dict:
 
 
 def is_kol_order(row) -> bool:
-    return str(row.get("客诉类型", "") or "").strip() == "深度达人"
+    return _clean_str(row.get("客诉类型")) == "深度达人"
 
 
 def _get_kol_name(row) -> str:
     """获取达人名字：优先"达人Name"列，fallback 到"Handle"列"""
-    name = str(row.get("达人Name", "") or "").strip()
-    if name and name.lower() != "nan":
+    name = _clean_str(row.get("达人Name"))
+    if name:
         return name
-    handle = str(row.get("Handle", "") or "").strip()
-    if handle and handle.lower() != "nan":
-        return handle
-    return ""
+    return _clean_str(row.get("Handle"))
 
 
 def get_recipient_info(row) -> dict:
     if is_kol_order(row):
-        addr_raw = str(row.get("地址", "") or "").strip()
+        addr_raw = _clean_str(row.get("地址"))
         parsed = parse_free_address(addr_raw)
         kol_name = _get_kol_name(row)
         return {
@@ -553,7 +603,7 @@ def _is_blank_value(v) -> bool:
     try:
         if pd.isna(v):
             return True
-    except Exception:
+    except (ValueError, TypeError):
         pass
     s = str(v).strip()
     return s == "" or s.lower() in {"nan", "none", "null"}
@@ -573,8 +623,8 @@ def _valid_us_state(v) -> bool:
 
 def _format_original_address(row) -> str:
     if is_kol_order(row):
-        return str(row.get("地址", "") or "").strip()
-    return str(row.get("Shipping Info", "") or "").strip()
+        return _clean_str(row.get("地址"))
+    return _clean_str(row.get("Shipping Info"))
 
 
 def validate_address_info(row, label_kind: str = "正常发货") -> list:
@@ -586,8 +636,8 @@ def validate_address_info(row, label_kind: str = "正常发货") -> list:
         issues.append({
             "影响Label": label_kind,
             "对象": role,
-            "订单号": str(row.get("Order ID", "") or "").strip(),
-            "客诉类型": str(row.get("客诉类型", "") or "").strip(),
+            "订单号": _clean_str(row.get("Order ID")),
+            "客诉类型": _clean_str(row.get("客诉类型")),
             "问题等级": level,
             "问题字段": field,
             "问题说明": message,
@@ -703,22 +753,18 @@ def explode_orders(orders, catalog):
     for _, r in orders.iterrows():
         order_id = r["Order ID"]
         ship_info = r.get("Shipping Info", "")
-        lark_loc = str(r.get("库位", "") or "").strip()
-        if lark_loc.lower() == "nan": lark_loc = ""
+        lark_loc = _clean_str(r.get("库位"))
 
         is_kol = is_kol_order(r)
 
         if is_kol:
-            pn_raw = str(r.get("款式", "") or "").strip()
-            sku_raw = str(r.get("SKU", "") or "").strip()
-            size_raw = str(r.get("Size", "") or "").strip()
+            pn_raw = _clean_str(r.get("款式"))
+            sku_raw = _clean_str(r.get("SKU"))
+            size_raw = _clean_str(r.get("Size"))
         else:
-            pn_raw = str(r.get("Product Name", "") or "").strip()
-            sku_raw = str(r.get("SKU", "") or "").strip()
-            size_raw = str(r.get(SIZE_COL, "") or "").strip()
-        if pn_raw.lower() == "nan": pn_raw = ""
-        if sku_raw.lower() == "nan": sku_raw = ""
-        if size_raw.lower() == "nan": size_raw = ""
+            pn_raw = _clean_str(r.get("Product Name"))
+            sku_raw = _clean_str(r.get("SKU"))
+            size_raw = _clean_str(r.get(SIZE_COL))
 
         pn_list = [p.strip() for p in pn_raw.split(",") if p.strip()] if pn_raw else []
         sku_list = [s.strip() for s in sku_raw.split(",") if s.strip()] if sku_raw else []
@@ -749,12 +795,12 @@ def explode_orders(orders, catalog):
                 "Order ID": order_id, "英文款式": cat_en_name, "SKU": sku_i,
                 "中文名": cn_name, "库位": final_loc, "Size": size_i,
                 "Shipping Info": ship_info,
-                "Full SKU": str(r.get("Full SKU", "") or "").strip(),
-                "客诉类型": str(r.get("客诉类型", "") or "").strip(),
+                "Full SKU": _clean_str(r.get("Full SKU")),
+                "客诉类型": _clean_str(r.get("客诉类型")),
                 "is_kol": is_kol,
                 "达人Name": _get_kol_name(r),
-                "Handle": str(r.get("Handle", "") or "").strip(),
-                "地址_raw": str(r.get("地址", "") or "").strip(),
+                "Handle": _clean_str(r.get("Handle")),
+                "地址_raw": _clean_str(r.get("地址")),
             })
     return pd.DataFrame(rows)
 
@@ -856,6 +902,7 @@ def _write_shuidan_workbook(rows_data: list) -> bytes:
             cell = ws.cell(row=r_idx, column=c, value=v)
             cell.font = Font(name="宋体", size=10)
 
+    # Order ID / 电话 / 城市 / 州 / 邮编 等列强制文本格式，防止 Excel 再次转科学计数法
     text_cols = [1, 9, 13, 17, 23]
     for col_idx in text_cols:
         for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
