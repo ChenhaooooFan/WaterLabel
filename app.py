@@ -451,13 +451,6 @@ def parse_shipping_info(text):
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_lark_data(file_bytes: bytes) -> pd.DataFrame:
-    """
-    读取 Lark 导出的 CSV。
-
-    【关键】Order ID / 电话 / Tracking 等长数字列强制按 str 读取，
-    否则 pandas 会推断成 float64，18 位订单号超出浮点精度，
-    末几位被截断 → 同一订单在不同表里 Order ID 不一致（“乱”）。
-    """
     df = pd.read_csv(
         io.BytesIO(file_bytes),
         dtype={col: str for col in TEXT_COLUMNS},
@@ -465,7 +458,6 @@ def load_lark_data(file_bytes: bytes) -> pd.DataFrame:
     )
     df["日期"] = df["日期"].astype(str).str.strip()
 
-    # 统一清洗：去首尾空格 + 把字符串 "nan"/"none"/"null"/空串 归一为真正的缺失值
     for col in TEXT_COLUMNS + ["Handle"]:
         if col in df.columns:
             df[col] = (
@@ -490,7 +482,6 @@ def load_catalog(file_bytes: bytes) -> pd.DataFrame:
 
 
 def _clean_str(v) -> str:
-    """统一把单元格转成干净字符串，过滤各种 nan 形态。"""
     if v is None:
         return ""
     try:
@@ -503,14 +494,6 @@ def _clean_str(v) -> str:
 
 
 def filter_orders_for_date(df, target_date):
-    """
-    筛选当日可发货订单。包括两种类型：
-    A) 普通订单：必须有 Order ID + Shipping Info
-    B) 深度达人订单：客诉类型为"深度达人"，有地址信息。
-       兼容两种 Lark View 导出格式：
-         格式 1（达人专属视图）：有"地址"+"达人Name"列
-         格式 2（普通水单视图）：有"地址"+"Handle"列，无"达人Name"列
-    """
     is_date = df["日期"] == target_date
     has_order_id = df["Order ID"].notna() if "Order ID" in df.columns else pd.Series([False] * len(df), index=df.index)
     has_shipping = df["Shipping Info"].notna() if "Shipping Info" in df.columns else pd.Series([False] * len(df), index=df.index)
@@ -518,7 +501,6 @@ def filter_orders_for_date(df, target_date):
 
     is_deep_kol = (df["客诉类型"] == "深度达人") if "客诉类型" in df.columns else pd.Series([False] * len(df), index=df.index)
     has_addr = df["地址"].notna() if "地址" in df.columns else pd.Series([False] * len(df), index=df.index)
-    # 达人名字：优先"达人Name"列，fallback 到"Handle"列
     has_kol_name = (
         df["达人Name"].notna() if "达人Name" in df.columns
         else df["Handle"].notna() if "Handle" in df.columns
@@ -529,7 +511,6 @@ def filter_orders_for_date(df, target_date):
     out = df[type_a | type_b].copy()
 
     def make_id(r):
-        # Order ID 现在一定是 str（或 NA），不再做 float→int 还原，避免精度丢失
         oid = _clean_str(r.get("Order ID"))
         if oid:
             return oid
@@ -566,7 +547,6 @@ def is_kol_order(row) -> bool:
 
 
 def _get_kol_name(row) -> str:
-    """获取达人名字：优先"达人Name"列，fallback 到"Handle"列"""
     name = _clean_str(row.get("达人Name"))
     if name:
         return name
@@ -578,8 +558,11 @@ def get_recipient_info(row) -> dict:
         addr_raw = _clean_str(row.get("地址"))
         parsed = parse_free_address(addr_raw)
         kol_name = _get_kol_name(row)
+        # 从"手机号"列读取电话，fallback 到"手机号 (1)"列
+        raw_phone = _clean_str(row.get("手机号")) or _clean_str(row.get("手机号 (1)"))
+        phone = _clean_phone(raw_phone) if raw_phone else ""
         return {
-            "name": kol_name, "phone": "",
+            "name": kol_name, "phone": phone,
             "street": parsed.get("street", ""), "street2": "",
             "city": parsed.get("city", ""), "state": parsed.get("state", ""),
             "country": "United States", "zip": parsed.get("zip", ""),
@@ -902,7 +885,6 @@ def _write_shuidan_workbook(rows_data: list) -> bytes:
             cell = ws.cell(row=r_idx, column=c, value=v)
             cell.font = Font(name="宋体", size=10)
 
-    # Order ID / 电话 / 城市 / 州 / 邮编 等列强制文本格式，防止 Excel 再次转科学计数法
     text_cols = [1, 9, 13, 17, 23]
     for col_idx in text_cols:
         for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
@@ -1325,7 +1307,7 @@ with tab2:
     st.subheader("第 2 步 · 核对面单 + 生成拣货单/发货单")
     st.caption(
         "上传 Lark CSV + 图册 + Label PDF → 自动核对 + 生成拣货单/发货单。"
-        "Return Label 勾选订单仍参与正常发货拣货；寄回给我们的 Return Label 本身不需要拣货。"
+        "Return Label 勾选订单仍参与正常发货拣货；顾客寄回给我们的 Return Label 本身不需要拣货。"
         "面单核对建议只上传正常发货 Label PDF，不要把寄回 Return Label PDF 混在一起。"
     )
 
