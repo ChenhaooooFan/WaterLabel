@@ -1064,11 +1064,14 @@ def _parse_label_text(text: str, page: int) -> dict:
     info = {"page": page, "order_id": "", "tracking": "",
             "name": "", "address_lines": [], "raw_text": text}
 
+    # OCR 行尾可能带杂质（如 "577401172090916887 Ba"），
+    # 所以不要求整行是数字，只要行内有 17-20 位连续数字即可；
+    # 前后加 (?<!\d)/(?!\d) 边界，避免误抓 22 位 USPS tracking 号的一段。
     for ln in reversed(lines):
-        digits = re.sub(r"\s", "", ln)
-        m = re.match(r"^(\d{17,20})(-\d+)?$", digits)
+        compact = re.sub(r"\s", "", ln)
+        m = re.search(r"(?<!\d)(\d{17,20})(-\d+)?(?!\d)", compact)
         if m:
-            info["order_id"] = digits
+            info["order_id"] = m.group(1) + (m.group(2) or "")
             break
 
     for ln in lines:
