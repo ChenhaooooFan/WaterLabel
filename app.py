@@ -45,18 +45,28 @@ SENDER_INFO = {
     "zip": "90071", "address": "515 S Flower St, Floor 18 & 19, STE 1901",
 }
 PACKAGE_DEFAULTS = {
-    "weight": 0.3, "length": 20, "width": 15, "height": 2,
-    "cn_name": "穿戴甲", "en_name": "Press-On Nails",
-    "qty": 1, "declare_price": 5, "net_weight": 0.3,
+    "logistics_product": "USPS-1", "box_count": 1, "gross_weight": 1,
+    "net_weight": "0.3", "length": "20", "width": "15", "height": "2",
 }
+
+# —— 水单 Excel 模板（对齐物流商 "FBA-多票批量导入-按总箱数" 批量导入模版）——
+SHUIDAN_TEMPLATE_TITLE = "FBA-多票批量导入-按总箱数-模版"
+SHUIDAN_TEMPLATE_NOTE = (
+    "1、币种 - 是指申报币种，只需要填写币种的国际编号。如：人民币对应CNY/美元对应USD/英磅对应GBP/欧元对应EUR/日元对应JPY\n"
+    "2、尺寸/重量单位 - 是指 采用英制还是公制单位，只需要填写 英制或公制即可。其中：公制单位为  重量:公斤/尺寸:厘米 ；英制单位为 重量:磅/尺寸:英寸\n"
+    "3、收件人公司需要填写FBA的仓库代码。若收件人名称填写“Amazon”，则收件人公司必须填写FBA仓库代码并且收件人省州、城市、地址、邮编可留空。\n"
+    "4、运输方式填写的是物流产品编码；同一票货，不允许采用不同的运输方式。\n"
+    "5、一票多箱的订单，如果箱规不一样，需要分多行填写。通过客户单号/入仓单号关联，表示是同一票货。\n"
+    "6、支持多个FBA订单同时导入\n"
+    "7、箱子(件)的长宽高和重量不填则默认为10。"
+)
 SHUIDAN_HEADERS = [
-    "客户订单号","物流产品(产品编号)","重量","长","宽","高",
-    "发件人姓名","发件人公司","发件人电话","发件人国家","发件人省/州",
-    "发件人城市","发件人邮编","发件人地址",
-    "收件人姓名","收件人公司","收件人电话","收件人国家","收件人省/州",
-    "收件人城市","收件人地址一","收件人地址二","收件人邮编",
-    "中文品名1","英文品名1","SKU1","数量1","配货备注1",
-    "申报单价1","单位净重(kg)1",
+    "客户单号/入库单号", "RefNo2", "RefNo3", "签名服务", "子客户单号",
+    "物流产品", "箱数(件数)", "毛重/箱", "净重/箱", "长/箱", "宽/箱", "高/箱",
+    "收件人名称", "收件人公司/FBA仓库编码", "收件人国家", "收件人州/省", "收件人城市",
+    "收件人地址", "收件人电话", "收件人邮编",
+    "发件人名称", "发件人公司", "发件人国家", "发件人州/省", "发件人城市",
+    "发件人地址", "发件人电话", "发件人邮编",
 ]
 SIZE_COL = "Size'"
 RETURN_LABEL_COL = "Return Label 包裹"
@@ -866,33 +876,96 @@ def build_packing_slip_csv(exploded: pd.DataFrame, date_str: str) -> bytes:
 # ============================================================
 # 文件 3：水单 Excel（正常发货：NailVesta → 客户）
 # ============================================================
+def _combine_address(street: str, street2: str) -> str:
+    street = (street or "").strip()
+    street2 = (street2 or "").strip()
+    if street and street2:
+        return f"{street}, {street2}"
+    return street or street2
+
+
 def _write_shuidan_workbook(rows_data: list) -> bytes:
     from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment
+    from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
+
+    n_cols = len(SHUIDAN_HEADERS)
+    last_col = get_column_letter(n_cols)
+
+    title_fill = PatternFill("solid", fgColor="0070C0")
+    note_fill = PatternFill("solid", fgColor="D9D9D9")
+    section_fill = PatternFill("solid", fgColor="DCE6F1")
+    fixed_fill = PatternFill("solid", fgColor="FFFF00")
 
     wb = Workbook()
     ws = wb.active
     ws.title = "sheet1"
 
+    # 第 1 行：标题
+    ws.merge_cells(f"A1:{last_col}1")
+    ws["A1"] = SHUIDAN_TEMPLATE_TITLE
+    ws["A1"].font = Font(name="微软雅黑", size=16, bold=True, color="FFFFFF")
+    ws["A1"].fill = title_fill
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    # 第 2 行：模板说明
+    ws["A2"] = "模板说明："
+    ws["A2"].font = Font(name="微软雅黑", size=12, bold=True)
+    ws["A2"].fill = note_fill
+    ws["A2"].alignment = Alignment(horizontal="left", vertical="center")
+    ws.merge_cells(f"B2:{last_col}2")
+    ws["B2"] = SHUIDAN_TEMPLATE_NOTE
+    ws["B2"].font = Font(name="微软雅黑", size=12, color="FF0000")
+    ws["B2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 110
+
+    # 第 3 行：币种 / 尺寸重量单位
+    ws["A3"] = "币种:"
+    ws["C3"] = "尺寸/重量单位:"
+    ws["A3"].fill = note_fill
+    ws["C3"].fill = note_fill
+    ws["B3"] = "USD"
+    ws["D3"] = "英制"
+    ws.merge_cells("E3:Q3")
+    for coord in ("A3", "B3", "C3", "D3"):
+        ws[coord].font = Font(name="微软雅黑", size=12)
+        ws[coord].alignment = Alignment(horizontal="left", vertical="center")
+
+    # 第 4 行：分组标题
+    ws.merge_cells("A4:L4"); ws["A4"] = "订单信息"
+    ws.merge_cells("M4:T4"); ws["M4"] = "收件人信息"
+    ws.merge_cells(f"U4:{last_col}4"); ws["U4"] = "发件人信息"
+    for coord in ("A4", "M4", "U4"):
+        cell = ws[coord]
+        cell.font = Font(name="微软雅黑", size=12, bold=True)
+        cell.fill = section_fill
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    # 第 5 行：列头
     for c, h in enumerate(SHUIDAN_HEADERS, 1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.font = Font(name="宋体", size=11, bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell = ws.cell(row=5, column=c, value=h)
+        cell.font = Font(name="微软雅黑", size=12, color="FF0000")
+        cell.fill = section_fill
+        cell.alignment = Alignment(horizontal="left", vertical="center")
 
-    for r_idx, row_vals in enumerate(rows_data, 2):
-        for c, v in enumerate(row_vals, 1):
-            cell = ws.cell(row=r_idx, column=c, value=v)
-            cell.font = Font(name="宋体", size=10)
+    # 第 6 行起：数据。row_vals 里每项是 (值, 是否固定值/需高亮)
+    for r_idx, row_vals in enumerate(rows_data, 6):
+        for c, (val, is_fixed) in enumerate(row_vals, 1):
+            cell = ws.cell(row=r_idx, column=c, value=val)
+            cell.font = Font(name="Calibri" if is_fixed else "宋体", size=11 if is_fixed else 10)
+            if is_fixed:
+                cell.fill = fixed_fill
 
-    text_cols = [1, 9, 13, 17, 23]
+    # 防止长订单号/电话/邮编被 Excel 转成科学计数法或丢掉前导零
+    text_cols = [1, 9, 10, 11, 12, 19, 20, 27, 28]
     for col_idx in text_cols:
-        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+        for row in ws.iter_rows(min_row=6, min_col=col_idx, max_col=col_idx):
             for cell in row:
                 cell.number_format = "@"
 
-    for c in range(1, len(SHUIDAN_HEADERS) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 14
+    for c in range(1, n_cols + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 16
 
     out = io.BytesIO()
     wb.save(out)
@@ -900,43 +973,43 @@ def _write_shuidan_workbook(rows_data: list) -> bytes:
 
 
 def build_shuidan_xlsx(orders: pd.DataFrame) -> bytes:
+    """正常发货：寄件人 = NailVesta，收件人 = 客户/达人"""
     rows_data = []
     for _, r in orders.iterrows():
         recip = get_recipient_info(r)
+        recip_addr = _combine_address(recip["street"], recip.get("street2", ""))
         rows_data.append([
-            r["Order ID"], None,
-            PACKAGE_DEFAULTS["weight"], PACKAGE_DEFAULTS["length"],
-            PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
-            SENDER_INFO["name"], None, SENDER_INFO["phone"],
-            SENDER_INFO["country"], SENDER_INFO["state"],
-            SENDER_INFO["city"], SENDER_INFO["zip"], SENDER_INFO["address"],
-            recip["name"], None, recip["phone"], "US",
-            state_to_abbr(recip["state"]), recip["city"],
-            recip["street"], recip["street2"] or None, recip["zip"],
-            PACKAGE_DEFAULTS["cn_name"], PACKAGE_DEFAULTS["en_name"],
-            None, PACKAGE_DEFAULTS["qty"], None,
-            PACKAGE_DEFAULTS["declare_price"], PACKAGE_DEFAULTS["net_weight"],
+            (r["Order ID"], False), (None, False), (None, False), (None, False), (None, False),
+            (PACKAGE_DEFAULTS["logistics_product"], True), (PACKAGE_DEFAULTS["box_count"], True),
+            (PACKAGE_DEFAULTS["gross_weight"], True), (PACKAGE_DEFAULTS["net_weight"], True),
+            (PACKAGE_DEFAULTS["length"], True), (PACKAGE_DEFAULTS["width"], True), (PACKAGE_DEFAULTS["height"], True),
+            (recip["name"], False), (None, False), ("US", True),
+            (state_to_abbr(recip["state"]), False), (recip["city"], False),
+            (recip_addr, False), (recip["phone"], False), (recip["zip"], False),
+            (SENDER_INFO["name"], True), (None, False), (SENDER_INFO["country"], True),
+            (SENDER_INFO["state"], True), (SENDER_INFO["city"], True),
+            (SENDER_INFO["address"], True), (SENDER_INFO["phone"], True), (SENDER_INFO["zip"], True),
         ])
     return _write_shuidan_workbook(rows_data)
 
 
 def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
+    """Return Label 寄回：寄件人 = 客户/达人，收件人 = NailVesta"""
     rows_data = []
     for _, r in orders.iterrows():
         sender = get_recipient_info(r)
+        sender_addr = _combine_address(sender["street"], sender.get("street2", ""))
         rows_data.append([
-            r["Order ID"], None,
-            PACKAGE_DEFAULTS["weight"], PACKAGE_DEFAULTS["length"],
-            PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
-            sender["name"], None, sender["phone"],
-            "US", state_to_abbr(sender["state"]),
-            sender["city"], sender["zip"], sender["street"],
-            SENDER_INFO["name"], None, SENDER_INFO["phone"], "US",
-            SENDER_INFO["state"], SENDER_INFO["city"],
-            SENDER_INFO["address"], None, SENDER_INFO["zip"],
-            PACKAGE_DEFAULTS["cn_name"], PACKAGE_DEFAULTS["en_name"],
-            None, PACKAGE_DEFAULTS["qty"], None,
-            PACKAGE_DEFAULTS["declare_price"], PACKAGE_DEFAULTS["net_weight"],
+            (r["Order ID"], False), (None, False), (None, False), (None, False), (None, False),
+            (PACKAGE_DEFAULTS["logistics_product"], True), (PACKAGE_DEFAULTS["box_count"], True),
+            (PACKAGE_DEFAULTS["gross_weight"], True), (PACKAGE_DEFAULTS["net_weight"], True),
+            (PACKAGE_DEFAULTS["length"], True), (PACKAGE_DEFAULTS["width"], True), (PACKAGE_DEFAULTS["height"], True),
+            (SENDER_INFO["name"], True), (None, False), ("US", True),
+            (SENDER_INFO["state"], True), (SENDER_INFO["city"], True),
+            (SENDER_INFO["address"], True), (SENDER_INFO["phone"], True), (SENDER_INFO["zip"], True),
+            (sender["name"], False), (None, False), ("US", False),
+            (state_to_abbr(sender["state"]), False), (sender["city"], False),
+            (sender_addr, False), (sender["phone"], False), (sender["zip"], False),
         ])
     return _write_shuidan_workbook(rows_data)
 
