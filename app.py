@@ -884,7 +884,14 @@ def _combine_address(street: str, street2: str) -> str:
     return street or street2
 
 
-def _write_shuidan_workbook(rows_data: list) -> bytes:
+# 喷黄高亮的固定列（与物流商模版一致，空白列也要标黄）
+# 正常发货：C-L 箱规区 + N/O 收件人公司国家 + U-AB 发件人(NailVesta)整段
+FIXED_COLS_NORMAL = set(range(3, 13)) | {14, 15} | set(range(21, 29))
+# Return Label：C-T 箱规区 + 收件人(NailVesta)整段；发件人=顾客不标黄
+FIXED_COLS_RETURN = set(range(3, 21))
+
+
+def _write_shuidan_workbook(rows_data: list, fixed_cols: set) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
@@ -949,10 +956,11 @@ def _write_shuidan_workbook(rows_data: list) -> bytes:
         cell.fill = section_fill
         cell.alignment = Alignment(horizontal="left", vertical="center")
 
-    # 第 6 行起：数据。row_vals 里每项是 (值, 是否固定值/需高亮)
+    # 第 6 行起：数据。固定列（含空白列）整列标黄
     for r_idx, row_vals in enumerate(rows_data, 6):
-        for c, (val, is_fixed) in enumerate(row_vals, 1):
+        for c, val in enumerate(row_vals, 1):
             cell = ws.cell(row=r_idx, column=c, value=val)
+            is_fixed = c in fixed_cols
             cell.font = Font(name="Calibri" if is_fixed else "宋体", size=11 if is_fixed else 10)
             if is_fixed:
                 cell.fill = fixed_fill
@@ -979,18 +987,18 @@ def build_shuidan_xlsx(orders: pd.DataFrame) -> bytes:
         recip = get_recipient_info(r)
         recip_addr = _combine_address(recip["street"], recip.get("street2", ""))
         rows_data.append([
-            (r["Order ID"], False), (None, False), (None, False), (None, False), (None, False),
-            (PACKAGE_DEFAULTS["logistics_product"], True), (PACKAGE_DEFAULTS["box_count"], True),
-            (PACKAGE_DEFAULTS["gross_weight"], True), (PACKAGE_DEFAULTS["net_weight"], True),
-            (PACKAGE_DEFAULTS["length"], True), (PACKAGE_DEFAULTS["width"], True), (PACKAGE_DEFAULTS["height"], True),
-            (recip["name"], False), (None, False), ("US", True),
-            (state_to_abbr(recip["state"]), False), (recip["city"], False),
-            (recip_addr, False), (recip["phone"], False), (recip["zip"], False),
-            (SENDER_INFO["name"], True), (None, False), (SENDER_INFO["country"], True),
-            (SENDER_INFO["state"], True), (SENDER_INFO["city"], True),
-            (SENDER_INFO["address"], True), (SENDER_INFO["phone"], True), (SENDER_INFO["zip"], True),
+            r["Order ID"], None, None, None, None,
+            PACKAGE_DEFAULTS["logistics_product"], PACKAGE_DEFAULTS["box_count"],
+            PACKAGE_DEFAULTS["gross_weight"], PACKAGE_DEFAULTS["net_weight"],
+            PACKAGE_DEFAULTS["length"], PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
+            recip["name"], None, "US",
+            state_to_abbr(recip["state"]), recip["city"],
+            recip_addr, recip["phone"], recip["zip"],
+            SENDER_INFO["name"], None, SENDER_INFO["country"],
+            SENDER_INFO["state"], SENDER_INFO["city"],
+            SENDER_INFO["address"], SENDER_INFO["phone"], SENDER_INFO["zip"],
         ])
-    return _write_shuidan_workbook(rows_data)
+    return _write_shuidan_workbook(rows_data, FIXED_COLS_NORMAL)
 
 
 def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
@@ -1000,18 +1008,18 @@ def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
         sender = get_recipient_info(r)
         sender_addr = _combine_address(sender["street"], sender.get("street2", ""))
         rows_data.append([
-            (r["Order ID"], False), (None, False), (None, False), (None, False), (None, False),
-            (PACKAGE_DEFAULTS["logistics_product"], True), (PACKAGE_DEFAULTS["box_count"], True),
-            (PACKAGE_DEFAULTS["gross_weight"], True), (PACKAGE_DEFAULTS["net_weight"], True),
-            (PACKAGE_DEFAULTS["length"], True), (PACKAGE_DEFAULTS["width"], True), (PACKAGE_DEFAULTS["height"], True),
-            (SENDER_INFO["name"], True), (None, False), ("US", True),
-            (SENDER_INFO["state"], True), (SENDER_INFO["city"], True),
-            (SENDER_INFO["address"], True), (SENDER_INFO["phone"], True), (SENDER_INFO["zip"], True),
-            (sender["name"], False), (None, False), ("US", False),
-            (state_to_abbr(sender["state"]), False), (sender["city"], False),
-            (sender_addr, False), (sender["phone"], False), (sender["zip"], False),
+            r["Order ID"], None, None, None, None,
+            PACKAGE_DEFAULTS["logistics_product"], PACKAGE_DEFAULTS["box_count"],
+            PACKAGE_DEFAULTS["gross_weight"], PACKAGE_DEFAULTS["net_weight"],
+            PACKAGE_DEFAULTS["length"], PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
+            SENDER_INFO["name"], None, "US",
+            SENDER_INFO["state"], SENDER_INFO["city"],
+            SENDER_INFO["address"], SENDER_INFO["phone"], SENDER_INFO["zip"],
+            sender["name"], None, "US",
+            state_to_abbr(sender["state"]), sender["city"],
+            sender_addr, sender["phone"], sender["zip"],
         ])
-    return _write_shuidan_workbook(rows_data)
+    return _write_shuidan_workbook(rows_data, FIXED_COLS_RETURN)
 
 
 # ============================================================
