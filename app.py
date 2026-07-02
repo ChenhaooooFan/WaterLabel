@@ -780,8 +780,12 @@ def explode_orders(orders, catalog):
                 if not name_i:
                     en_v = cat_row.get("款式英文名称", "")
                     cat_en_name = "" if pd.isna(en_v) else str(en_v).strip()
-                if not sku_i and cat_row.name:
-                    sku_i = str(cat_row.name)
+                if not sku_i:
+                    # 按名称索引时 SKU 还是普通列；按 SKU 索引时 SKU 在 index(name) 上
+                    if "SKU" in cat_row.index and pd.notna(cat_row.get("SKU")):
+                        sku_i = str(cat_row.get("SKU")).strip()
+                    elif cat_row.name:
+                        sku_i = str(cat_row.name)
             size_i = size_map.get(name_i, size_map.get("_default", size_raw))
             final_loc = cat_loc or lark_loc
             rows.append({
@@ -794,6 +798,8 @@ def explode_orders(orders, catalog):
                 "达人Name": _get_kol_name(r),
                 "Handle": _clean_str(r.get("Handle")),
                 "地址_raw": _clean_str(r.get("地址")),
+                "備註": _clean_str(r.get("備註")),
+                "手机号_raw": _clean_str(r.get("手机号")) or _clean_str(r.get("手机号 (1)")),
             })
     return pd.DataFrame(rows)
 
@@ -841,8 +847,9 @@ def build_packing_slip_csv(exploded: pd.DataFrame, date_str: str) -> bytes:
         first = grp.iloc[0]
         if first.get("is_kol", False):
             recip_addr = parse_free_address(first.get("地址_raw", ""))
+            kol_phone = _clean_phone(first.get("手机号_raw", "")) if first.get("手机号_raw", "") else ""
             recip = {
-                "name": first.get("达人Name", ""), "phone": "",
+                "name": first.get("达人Name", ""), "phone": kol_phone,
                 "street": recip_addr.get("street", ""), "street2": "",
                 "city": recip_addr.get("city", ""), "state": recip_addr.get("state", ""),
                 "zip": recip_addr.get("zip", ""), "country": "United States",
@@ -869,6 +876,7 @@ def build_packing_slip_csv(exploded: pd.DataFrame, date_str: str) -> bytes:
                 "客诉类型": r.get("客诉类型", ""),
                 "SKU": r["SKU"] or "", "Style": r["英文款式"] or "",
                 "Chinese Name": r["中文名"] or "", "Size": r["Size"] or "", "Qty": 1,
+                "備註": r.get("備註", "") or "",
             })
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
 
@@ -1096,6 +1104,10 @@ def _parse_label_text(text: str, page: int) -> dict:
     return info
 
 
+def _norm_name(s):
+    return re.sub(r"[^A-Z0-9]", "", s.upper()) if s else ""
+
+
 def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
     label_by_oid = {}
     for lbl in labels:
@@ -1104,25 +1116,49 @@ def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
         if oid_base:
             label_by_oid[oid_base] = lbl
 
+    matched_pages = set()
+
+    def match_by_name_zip(name, zip_code):
+        # 达人单面单上没有 18 位数字订单号，按 姓名+邮编 在剩余面单里找
+        n = _norm_name(name)
+        if not n or not zip_code:
+            return None
+        for l in labels:
+            if l["page"] in matched_pages:
+                continue
+            ln = _norm_name(l["name"])
+            last = l["address_lines"][-1] if l["address_lines"] else ""
+            if zip_code in last and ln and (n in ln or ln in n or _ratio(n, ln) >= 0.7):
+                return l
+        return None
+
     rows = []
     for _, r in orders.iterrows():
         oid = str(r["Order ID"]).strip()
-        ship = parse_shipping_info(r.get("Shipping Info", ""))
-        lark_name = ship.get("name", "")
-        lark_zip = ship.get("zip", "")
-        lark_state = state_to_abbr(ship.get("state", ""))
+        # 用 get_recipient_info：客户单走 Shipping Info，深度达人单走"地址"列，
+        # 否则达人单核对时会因取不到姓名/邮编而全部误报不匹配
+        recip = get_recipient_info(r)
+        lark_name = recip.get("name", "")
+        lark_zip = recip.get("zip", "")
+        lark_state = state_to_abbr(recip.get("state", ""))
 
         lbl = label_by_oid.get(oid)
+        is_kol_oid = oid.startswith("KOL-")
+        if not lbl and is_kol_oid:
+            lbl = match_by_name_zip(lark_name, lark_zip)
         if not lbl:
             rows.append({
                 "Order ID": oid, "状态": "❌ 缺面单",
                 "Lark 收件人": lark_name, "Label 收件人": "—",
                 "Lark 邮编": lark_zip, "Label 末行": "—",
-                "Tracking": "—", "备注": "PDF 中找不到此订单的面单",
+                "Tracking": "—",
+                "备注": "达人单无数字单号，按姓名+邮编也未在 PDF 中找到面单"
+                        if is_kol_oid else "PDF 中找不到此订单的面单",
             })
             continue
+        matched_pages.add(lbl["page"])
 
-        def norm(s): return re.sub(r"[^A-Z0-9]", "", s.upper()) if s else ""
+        norm = _norm_name
         lark_n = norm(lark_name); lbl_n = norm(lbl["name"])
         last_line = lbl["address_lines"][-1] if lbl["address_lines"] else ""
         zip_in_label = lark_zip and lark_zip in last_line
@@ -1153,7 +1189,7 @@ def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
 
     lark_oids = set(str(o).strip() for o in orders["Order ID"])
     for oid_base, lbl in label_by_oid.items():
-        if oid_base not in lark_oids:
+        if oid_base not in lark_oids and lbl["page"] not in matched_pages:
             rows.append({
                 "Order ID": lbl["order_id"], "状态": "❌ 多余面单",
                 "Lark 收件人": "—", "Label 收件人": lbl["name"],
