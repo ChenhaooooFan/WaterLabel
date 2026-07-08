@@ -12,9 +12,11 @@ NailVesta 发货系统（两阶段工作流）
       如果 Return Label 包裹列打勾，这一行仍然需要生成一张「正常发货水单」；
       同时额外生成一张「Return Label 水单」。也就是同一行会产出 2 张 label 需求。
 
-阶段 2（拣货 + 发货 + 核对）:
-    Lark CSV + 图册 CSV + Label PDF → OCR 核对 + 生成拣货单/发货单
-    Return Label 勾选订单仍参与正常发货拣货；顾客寄回给我们的 Return Label 本身不参与拣货。
+阶段 2（拣货单 & 发货单生成器，原独立程序全功能移植）:
+    上传 客人水单 CSV / 深度达人单 CSV（可只传其一）
+    → 拣货单 CSV（库位 × 款式 × S/M/L 汇总）
+    → 发货单 PDF（按 Tracking No. 一单一页：黄底单号 / 粉底收件人 /
+      地址 / 款式库位尺码数量表格 / 红字备注；同上/空白自动继承上一行）
 
 ========================================================
 【2026-06 修复】Order ID 乱码问题
@@ -28,13 +30,26 @@ NailVesta 发货系统（两阶段工作流）
 import io
 import os
 import re
-import subprocess
-import tempfile
+from collections import OrderedDict
 from datetime import datetime
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (PageBreak, Paragraph, SimpleDocTemplate,
+                                    Spacer, Table, TableStyle)
+    from reportlab.lib.styles import ParagraphStyle
+    REPORTLAB_OK = True
+except ImportError:
+    REPORTLAB_OK = False
 
 # ============================================================
 # 常量
@@ -490,16 +505,19 @@ def warn_if_corrupted_order_ids(df: pd.DataFrame):
         )
 
 
-@st.cache_data(show_spinner=False)
-def load_catalog(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    keep = ["SKU","中文名称","款式英文名称","甲型","图片","库位","所属系列"]
-    keep = [c for c in keep if c in df.columns]
-    df = df[keep].copy()
-    df["SKU"] = df["SKU"].astype(str).str.strip()
-    if "款式英文名称" in df.columns:
-        df["款式英文名称"] = df["款式英文名称"].astype(str).str.strip()
-    return df
+def warn_if_corrupted_tracking(df: pd.DataFrame):
+    """检测被 Excel 打开保存过的 CSV：打包 Tracking No. 变成科学计数法(9.4e+21)，精度已永久丢失"""
+    if "打包 Tracking No." not in df.columns:
+        return
+    s = df["打包 Tracking No."].dropna().astype(str)
+    bad = int(s.str.contains(r"[eE]\+", regex=True).sum())
+    if bad > 0:
+        st.error(
+            f"🚨 检测到 {bad} 行「打包 Tracking No.」是科学计数法（如 9.40013E+21）——"
+            "这份 CSV 曾被 Excel 打开并保存过，Tracking 号末尾已永久丢失，无法恢复，"
+            "发货单 PDF 会显示这个坏值。"
+            "请回 Lark 重新导出 CSV 直接上传，不要用 Excel 打开后另存。"
+        )
 
 
 def _clean_str(v) -> str:
@@ -711,190 +729,6 @@ def build_address_issue_report(orders: pd.DataFrame, label_kind: str = "正常�
 def address_report_csv(report: pd.DataFrame) -> bytes:
     return report.to_csv(index=False).encode("utf-8-sig")
 
-
-# ============================================================
-# 组合装拆单 + 图册富集
-# ============================================================
-def _parse_size(size_raw):
-    s = str(size_raw).strip() if size_raw else ""
-    if ";" in s:
-        mapping = {"_default": s}
-        for part in s.split(";"):
-            part = part.strip()
-            m = re.match(r"^(.+?)\s+(S|M|L|XL|XS|\d+\s*个)$", part, re.I)
-            if m: mapping[m.group(1).strip()] = m.group(2).strip()
-        return mapping
-    return {"_default": s}
-
-
-def explode_orders(orders, catalog):
-    cat_by_name = cat_by_sku = None
-    if catalog is not None and not catalog.empty:
-        if "款式英文名称" in catalog.columns:
-            tmp = catalog.dropna(subset=["款式英文名称"]).copy()
-            tmp["_key"] = tmp["款式英文名称"].astype(str).str.strip().str.lower()
-            cat_by_name = tmp.set_index("_key")
-        cat_by_sku = catalog.set_index("SKU")
-
-    def lookup_by_name(name):
-        if cat_by_name is None or not name: return None
-        key = name.strip().lower()
-        if key in cat_by_name.index:
-            row = cat_by_name.loc[key]
-            if isinstance(row, pd.DataFrame): row = row.iloc[0]
-            return row
-        return None
-
-    def lookup_by_sku(sku):
-        if cat_by_sku is None or not sku: return None
-        if sku in cat_by_sku.index:
-            row = cat_by_sku.loc[sku]
-            if isinstance(row, pd.DataFrame): row = row.iloc[0]
-            return row
-        return None
-
-    rows = []
-    for _, r in orders.iterrows():
-        order_id = r["Order ID"]
-        ship_info = r.get("Shipping Info", "")
-        lark_loc = _clean_str(r.get("库位"))
-
-        is_kol = is_kol_order(r)
-
-        if is_kol:
-            pn_raw = _clean_str(r.get("款式"))
-            sku_raw = _clean_str(r.get("SKU"))
-            size_raw = _clean_str(r.get("Size"))
-        else:
-            pn_raw = _clean_str(r.get("Product Name"))
-            sku_raw = _clean_str(r.get("SKU"))
-            size_raw = _clean_str(r.get(SIZE_COL))
-
-        pn_list = [p.strip() for p in pn_raw.split(",") if p.strip()] if pn_raw else []
-        sku_list = [s.strip() for s in sku_raw.split(",") if s.strip()] if sku_raw else []
-        size_map = _parse_size(size_raw)
-        n = max(len(pn_list), len(sku_list), 1)
-
-        for i in range(n):
-            name_i = pn_list[i] if i < len(pn_list) else ""
-            sku_i = sku_list[i] if i < len(sku_list) else ""
-            cat_row = lookup_by_name(name_i) if name_i else None
-            if cat_row is None:
-                cat_row = lookup_by_sku(sku_i) if sku_i else None
-            cn_name = cat_loc = ""
-            cat_en_name = name_i
-            if cat_row is not None:
-                cn_v = cat_row.get("中文名称", "")
-                cn_name = "" if pd.isna(cn_v) else str(cn_v).strip()
-                loc_v = cat_row.get("库位", "")
-                cat_loc = "" if pd.isna(loc_v) else str(loc_v).strip()
-                if not name_i:
-                    en_v = cat_row.get("款式英文名称", "")
-                    cat_en_name = "" if pd.isna(en_v) else str(en_v).strip()
-                if not sku_i:
-                    # 按名称索引时 SKU 还是普通列；按 SKU 索引时 SKU 在 index(name) 上
-                    if "SKU" in cat_row.index and pd.notna(cat_row.get("SKU")):
-                        sku_i = str(cat_row.get("SKU")).strip()
-                    elif cat_row.name:
-                        sku_i = str(cat_row.name)
-            size_i = size_map.get(name_i, size_map.get("_default", size_raw))
-            final_loc = cat_loc or lark_loc
-            rows.append({
-                "Order ID": order_id, "英文款式": cat_en_name, "SKU": sku_i,
-                "中文名": cn_name, "库位": final_loc, "Size": size_i,
-                "Shipping Info": ship_info,
-                "Full SKU": _clean_str(r.get("Full SKU")),
-                "客诉类型": _clean_str(r.get("客诉类型")),
-                "is_kol": is_kol,
-                "达人Name": _get_kol_name(r),
-                "Handle": _clean_str(r.get("Handle")),
-                "地址_raw": _clean_str(r.get("地址")),
-                # Lark 表同时存在繁体「備註」和简体「备注」两列，都带入发货单
-                "備註": " | ".join(dict.fromkeys(
-                    x for x in (_clean_str(r.get("備註")), _clean_str(r.get("备注"))) if x
-                )),
-                "手机号_raw": _clean_str(r.get("手机号")) or _clean_str(r.get("手机号 (1)")),
-            })
-    return pd.DataFrame(rows)
-
-
-# ============================================================
-# 文件 1：拣货表（按库位汇总）
-# ============================================================
-def build_picking_summary_csv(exploded: pd.DataFrame) -> bytes:
-    if len(exploded) == 0:
-        return pd.DataFrame(columns=["库位","Product Name","S","M","L","其他","Total"]).to_csv(index=False).encode("utf-8-sig")
-
-    df = exploded.copy()
-    df["Size"] = df["Size"].fillna("").astype(str).str.strip().str.upper()
-
-    def size_bucket(s):
-        if s in ("S","M","L"): return s
-        if s in ("XS","XL"): return s
-        return "其他"
-    df["SizeBucket"] = df["Size"].apply(size_bucket)
-
-    grouped = df.groupby(["库位", "英文款式", "SizeBucket"]).size().unstack(fill_value=0)
-    for c in ["S","M","L"]:
-        if c not in grouped.columns: grouped[c] = 0
-    other_cols = [c for c in grouped.columns if c not in ("S","M","L")]
-    grouped["其他"] = grouped[other_cols].sum(axis=1) if other_cols else 0
-    grouped["Total"] = grouped[["S","M","L","其他"]].sum(axis=1)
-    grouped = grouped[["S","M","L","其他","Total"]].reset_index()
-    grouped = grouped.rename(columns={"英文款式": "Product Name"})
-
-    grouped["_loc_sort"] = grouped["库位"].apply(lambda x: (x == "", x))
-    grouped = grouped.sort_values(by=["_loc_sort", "Product Name"]).drop(columns=["_loc_sort"]).reset_index(drop=True)
-
-    if (grouped["其他"] == 0).all():
-        grouped = grouped.drop(columns=["其他"])
-
-    return grouped.to_csv(index=False).encode("utf-8-sig")
-
-
-# ============================================================
-# 文件 2：Packing Slip CSV
-# ============================================================
-def build_packing_slip_csv(exploded: pd.DataFrame, date_str: str) -> bytes:
-    rows = []
-    for order_id, grp in exploded.groupby("Order ID", sort=False):
-        first = grp.iloc[0]
-        if first.get("is_kol", False):
-            recip_addr = parse_free_address(first.get("地址_raw", ""))
-            kol_phone = _clean_phone(first.get("手机号_raw", "")) if first.get("手机号_raw", "") else ""
-            recip = {
-                "name": first.get("达人Name", ""), "phone": kol_phone,
-                "street": recip_addr.get("street", ""), "street2": "",
-                "city": recip_addr.get("city", ""), "state": recip_addr.get("state", ""),
-                "zip": recip_addr.get("zip", ""), "country": "United States",
-            }
-        else:
-            ship = parse_shipping_info(first.get("Shipping Info", ""))
-            recip = {
-                "name": ship.get("name", ""), "phone": ship.get("phone", ""),
-                "street": ship.get("street", ""), "street2": ship.get("street2", ""),
-                "city": ship.get("city", ""), "state": ship.get("state", ""),
-                "zip": ship.get("zip", ""), "country": ship.get("country", "United States"),
-            }
-        addr_parts = [p for p in [
-            recip["street"], recip["street2"],
-            f"{recip['city']}, {state_to_abbr(recip['state'])} {recip['zip']}".strip(", "),
-            recip["country"],
-        ] if p.strip(" ,")]
-        full_address = " | ".join(addr_parts)
-        for _, r in grp.iterrows():
-            rows.append({
-                "Order ID": order_id, "Date": date_str,
-                "Recipient": recip["name"].title() if recip["name"] else "",
-                "Phone": recip["phone"], "Address": full_address,
-                "客诉类型": r.get("客诉类型", ""),
-                "SKU": r["SKU"] or "", "Style": r["英文款式"] or "",
-                "Chinese Name": r["中文名"] or "", "Size": r["Size"] or "", "Qty": 1,
-                "備註": r.get("備註", "") or "",
-            })
-    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
-
-
 # ============================================================
 # 文件 3：水单 Excel（正常发货：NailVesta → 客户）
 # ============================================================
@@ -999,199 +833,325 @@ def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
     return _write_shuidan_workbook(rows_data, FIXED_COLS_RETURN)
 
 
-# ============================================================
-# Label PDF OCR & 核对
-# ============================================================
-def check_ocr_available() -> tuple:
-    has_tess = subprocess.run(["which","tesseract"], capture_output=True).returncode == 0
-    has_popp = subprocess.run(["which","pdftoppm"], capture_output=True).returncode == 0
-    return has_tess, has_popp
-
-
-def parse_label_pdf(pdf_bytes: bytes) -> list:
-    has_tess, has_popp = check_ocr_available()
-    if not (has_tess and has_popp):
-        raise RuntimeError("OCR 工具未安装：需要 tesseract + poppler-utils")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        pdf_path = os.path.join(tmp, "labels.pdf")
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_bytes)
-        subprocess.run(
-            ["pdftoppm", "-jpeg", "-r", "200", pdf_path, os.path.join(tmp, "lbl")],
-            capture_output=True, timeout=120,
-        )
-        jpgs = sorted([f for f in os.listdir(tmp) if f.startswith("lbl") and f.endswith(".jpg")])
-
-        results = []
-        for jpg in jpgs:
-            jpg_path = os.path.join(tmp, jpg)
-            page_num = int(re.search(r"lbl-(\d+)", jpg).group(1))
-            text = subprocess.run(
-                ["tesseract", jpg_path, "-"],
-                capture_output=True, text=True, timeout=30,
-            ).stdout
-            results.append(_parse_label_text(text, page_num))
-        results.sort(key=lambda x: x["page"])
-        return results
-
-
-def _parse_label_text(text: str, page: int) -> dict:
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    info = {"page": page, "order_id": "", "tracking": "",
-            "name": "", "address_lines": [], "raw_text": text}
-
-    # OCR 行尾可能带杂质（如 "577401172090916887 Ba"），
-    # 所以不要求整行是数字，只要行内有 17-20 位连续数字即可；
-    # 前后加 (?<!\d)/(?!\d) 边界，避免误抓 22 位 USPS tracking 号的一段。
-    for ln in reversed(lines):
-        compact = re.sub(r"\s", "", ln)
-        m = re.search(r"(?<!\d)(\d{17,20})(-\d+)?(?!\d)", compact)
-        if m:
-            info["order_id"] = m.group(1) + (m.group(2) or "")
-            break
-
-    for ln in lines:
-        if re.search(r"9\d{3}\s+\d{4}\s+\d{4}\s+\d{4}", ln):
-            info["tracking"] = re.sub(r"\s+", "", ln)
-            break
-
-    in_addr = False
-    for ln in lines:
-        if "LOS ANGELES" in ln.upper() and "CA" in ln.upper():
-            in_addr = True; continue
-        if in_addr:
-            if "TRACKING" in ln.upper(): break
-            cleaned = re.sub(r"^([a-zA-Z]+:?\s*[=>:;©]+\s*|[=>:;©]+\s*|[a-z]\s+|[a-zA-Z0-9]{1,4}[=:;©]\s*)", "", ln)
-            cleaned = re.sub(r"^[a-z]:\s*", "", cleaned)
-            cleaned = re.sub(r"^[=>:;]+\s*", "", cleaned).strip()
-            if cleaned and re.search(r"[A-Za-z0-9]", cleaned):
-                info["address_lines"].append(cleaned)
-
-    if info["address_lines"]:
-        info["name"] = info["address_lines"][0].upper().strip()
-    return info
-
-
-def _norm_name(s):
-    return re.sub(r"[^A-Z0-9]", "", s.upper()) if s else ""
-
-
-def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
-    label_by_oid = {}
-    for lbl in labels:
-        oid = lbl["order_id"]
-        oid_base = re.sub(r"-\d+$", "", oid)
-        if oid_base:
-            label_by_oid[oid_base] = lbl
-
-    matched_pages = set()
-
-    def match_by_name_zip(name, zip_code):
-        # 达人单面单上没有 18 位数字订单号，按 姓名+邮编 在剩余面单里找
-        n = _norm_name(name)
-        if not n or not zip_code:
-            return None
-        for l in labels:
-            if l["page"] in matched_pages:
+# ============================================================================
+# 拣货单 & 发货单生成器（原程序全功能移植，逻辑一字未改）
+# ============================================================================
+def _register_cjk_font() -> str:
+    """Try to register a TTF font that covers all CJK (incl. traditional).
+    Falls back to the built-in CID font if none found."""
+    candidates = [
+        # Linux / Streamlit Cloud (install via packages.txt: fonts-noto-cjk)
+        "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        # macOS
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/Library/Fonts/Songti.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont("CJKFont", path))
+                return "CJKFont"
+            except Exception:
                 continue
-            ln = _norm_name(l["name"])
-            last = l["address_lines"][-1] if l["address_lines"] else ""
-            if zip_code in last and ln and (n in ln or ln in n or _ratio(n, ln) >= 0.7):
-                return l
-        return None
+    # Built-in CID fallback (covers GB2312 simplified CJK)
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    return "STSong-Light"
 
+CJK = _register_cjk_font() if REPORTLAB_OK else None
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def extract_location(loc_field: str) -> str:
+    m = re.search(r"库位：(\S+)", str(loc_field))
+    return m.group(1).strip() if m else str(loc_field).strip()
+
+
+def split_shipping_info(raw: str) -> tuple:
+    """Return (name, address) from multi-line Shipping Info.
+    Format: Name / (+1)Phone / Street / City,State,Country / Zip
+    """
+    lines = [l.strip() for l in str(raw).split("\n") if l.strip()]
+    if not lines:
+        return "", ""
+    name = lines[0]
+    # Drop the phone line (starts with parenthesis)
+    addr_lines = [l for l in lines[1:] if not re.match(r"^\(", l)]
+    return name, "\n".join(addr_lines)
+
+
+def is_blank(val: str) -> bool:
+    return val.strip().lower() in ("", "nan")
+
+
+# ── Parsers ──────────────────────────────────────────────────────────────────
+
+def parse_customer_rows(df: pd.DataFrame) -> list:
     rows = []
-    for _, r in orders.iterrows():
-        oid = str(r["Order ID"]).strip()
-        # 用 get_recipient_info：客户单走 Shipping Info，深度达人单走"地址"列，
-        # 否则达人单核对时会因取不到姓名/邮编而全部误报不匹配
-        recip = get_recipient_info(r)
-        lark_name = recip.get("name", "")
-        lark_zip = recip.get("zip", "")
-        lark_state = state_to_abbr(recip.get("state", ""))
+    prev_tracking = prev_name = prev_address = prev_note = ""
+    order_seq = 0  # 每遇到一个新地址块（非"同上"/非空）就是新订单，避免多单因 Tracking 同为空而被误合并成一页
 
-        lbl = label_by_oid.get(oid)
-        is_kol_oid = oid.startswith("KOL-")
-        # Order ID 被 Excel 存成科学计数法(5.77E+17)时同样无法按单号匹配
-        is_corrupted_oid = bool(re.search(r"[eE]\+", oid))
-        matched_by_name = False
-        if not lbl and (is_kol_oid or is_corrupted_oid):
-            lbl = match_by_name_zip(lark_name, lark_zip)
-            matched_by_name = lbl is not None
-        if not lbl:
-            if is_kol_oid:
-                miss_note = "达人单无数字单号，按姓名+邮编也未在 PDF 中找到面单"
-            elif is_corrupted_oid:
-                miss_note = "Order ID 已损坏(科学计数法)，按姓名+邮编也未找到面单；请重新导出 CSV"
-            else:
-                miss_note = "PDF 中找不到此订单的面单"
-            rows.append({
-                "Order ID": oid, "状态": "❌ 缺面单",
-                "Lark 收件人": lark_name, "Label 收件人": "—",
-                "Lark 邮编": lark_zip, "Label 末行": "—",
-                "Tracking": "—", "备注": miss_note,
-            })
-            continue
-        matched_pages.add(lbl["page"])
+    for _, r in df.iterrows():
+        size         = str(r.get("Size'", "")).strip()
+        loc_raw      = str(r.get("库位", "")).strip()
+        tracking_raw = str(r.get("打包 Tracking No.", "")).strip()
+        note         = str(r.get("備註", "")).strip()
+        shipping_raw = str(r.get("Shipping Info", "")).strip()
 
-        norm = _norm_name
-        lark_n = norm(lark_name); lbl_n = norm(lbl["name"])
-        last_line = lbl["address_lines"][-1] if lbl["address_lines"] else ""
-        zip_in_label = lark_zip and lark_zip in last_line
-
-        name_match = lark_n and lbl_n and (
-            lark_n in lbl_n or lbl_n in lark_n
-            or _ratio(lark_n, lbl_n) >= 0.7
-        )
-
-        if name_match and zip_in_label:
-            status = "✅ 一致"; note = ""
-        elif name_match:
-            status = "⚠️ 名字一致但邮编对不上"
-            note = f"Lark={lark_zip} | Label={last_line}"
-        elif zip_in_label:
-            status = "⚠️ 邮编一致但名字 OCR 模糊"
-            note = f"Lark={lark_name} | Label={lbl['name']}"
+        # 同上 or blank shipping info → inherit name/address（先算这个，用来判断是否新订单）
+        is_new_order = not (is_blank(shipping_raw) or shipping_raw == "同上")
+        if is_new_order:
+            name, address = split_shipping_info(shipping_raw)
+            prev_name, prev_address = name, address
+            order_seq += 1
         else:
-            status = "❌ 不匹配"
-            note = f"Lark={lark_name} {lark_zip} | Label={lbl['name']} {last_line}"
+            name, address = prev_name, prev_address
 
-        if matched_by_name and is_corrupted_oid:
-            note = ("Order ID 已损坏，按姓名+邮编匹配到面单；建议重新导出 CSV。" + note).strip("。 ")
+        # 同上 or blank tracking → inherit from previous row；仍为空则保留空，不臆造
+        if is_blank(tracking_raw) or tracking_raw == "同上":
+            tracking = prev_tracking
+        else:
+            tracking = tracking_raw
+            prev_tracking = tracking
 
-        rows.append({
-            "Order ID": oid, "状态": status,
-            "Lark 收件人": lark_name, "Label 收件人": lbl["name"],
-            "Lark 邮编": lark_zip, "Label 末行": last_line,
-            "Tracking": lbl["tracking"], "备注": note,
-        })
+        if is_blank(note):
+            note = ""
 
-    lark_oids = set(str(o).strip() for o in orders["Order ID"])
-    for oid_base, lbl in label_by_oid.items():
-        if oid_base not in lark_oids and lbl["page"] not in matched_pages:
-            rows.append({
-                "Order ID": lbl["order_id"], "状态": "❌ 多余面单",
-                "Lark 收件人": "—", "Label 收件人": lbl["name"],
-                "Lark 邮编": "—",
-                "Label 末行": lbl["address_lines"][-1] if lbl["address_lines"] else "",
-                "Tracking": lbl["tracking"], "备注": "Label PDF 含此订单但 Lark 当日无此单",
-            })
-
-    return pd.DataFrame(rows)
+        # Parse product name + location directly from 库位 column
+        # Each entry format: "Product Name ｜ 库位：A-01-01"
+        for part in loc_raw.split(","):
+            part = part.strip()
+            m = re.match(r"(.+?)\s*｜\s*库位：(\S+)", part)
+            if m:
+                product = m.group(1).strip()
+                loc     = m.group(2).strip()
+            else:
+                continue  # skip malformed entries
+            rows.append(dict(tracking=tracking, order_key=order_seq, name=name, address=address,
+                             product=product, location=loc, size=size, note=note))
+    return rows
 
 
-def _ratio(a, b):
-    if not a or not b: return 0
-    if a == b: return 1
-    m, n = len(a), len(b)
-    dp = [[0]*(n+1) for _ in range(m+1)]
-    for i in range(1, m+1):
-        for j in range(1, n+1):
-            if a[i-1] == b[j-1]: dp[i][j] = dp[i-1][j-1] + 1
-            else: dp[i][j] = max(dp[i-1][j], dp[i][j-1])
-    return dp[m][n] / max(m, n)
+def parse_influencer_rows(df: pd.DataFrame) -> list:
+    rows = []
+    for idx, (_, r) in enumerate(df.iterrows()):
+        size         = str(r.get("Size", "")).strip()
+        loc_raw      = str(r.get("款式 + 库位", "")).strip()
+        tracking     = str(r.get("打包 Tracking No.", "")).strip()
+        note         = str(r.get("備註", "")).strip()
+        name         = str(r.get("达人Name", "")).strip()
+        address      = str(r.get("地址", "")).strip()
 
+        if is_blank(tracking):
+            tracking = ""
+        if is_blank(note):
+            note = ""
+
+        entries = [e.strip() for e in loc_raw.split(",") if e.strip()]
+        for entry in entries:
+            m = re.match(r"(.+?)\s*｜\s*库位：(\S+)", entry)
+            if m:
+                product, loc = m.group(1).strip(), m.group(2).strip()
+            else:
+                product, loc = entry, ""
+            # 每行 iterrows 本身就是一个独立订单，用行号做 order_key，Tracking 缺失也不会互相合并
+            rows.append(dict(tracking=tracking, order_key=idx, name=name, address=address,
+                             product=product, location=loc, size=size, note=note))
+    return rows
+
+
+# ── Pick list (CSV) ──────────────────────────────────────────────────────────
+
+def make_pick_list(rows: list) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["库位", "款式", "S", "M", "L", "合计"])
+    df = pd.DataFrame(rows)
+    df["qty"] = 1
+    pivot = (df.groupby(["location", "product", "size"])["qty"]
+               .sum().unstack(fill_value=0).reset_index())
+    pivot.columns.name = None
+    for col in ["S", "M", "L"]:
+        if col not in pivot.columns:
+            pivot[col] = 0
+    pivot["合计"] = pivot[["S", "M", "L"]].sum(axis=1)
+    pivot = pivot[["location", "product", "S", "M", "L", "合计"]]
+    pivot.columns = ["库位", "款式", "S", "M", "L", "合计"]
+    return pivot.sort_values(["库位", "款式"]).reset_index(drop=True)
+
+
+# ── Shipping list (PDF) ──────────────────────────────────────────────────────
+
+def make_shipping_pdf(rows: list) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                            leftMargin=0.6*inch, rightMargin=0.6*inch,
+                            topMargin=0.6*inch, bottomMargin=0.6*inch)
+
+    YELLOW     = colors.HexColor("#FFE600")
+    PINK       = colors.HexColor("#FFD6E0")
+    HEADER_BG  = colors.HexColor("#4A90D9")
+
+    tracking_style = ParagraphStyle(
+        "tracking", fontName=CJK, fontSize=22, leading=28,
+        spaceAfter=10, backColor=YELLOW,
+        leftIndent=6, rightIndent=6,
+    )
+    name_style = ParagraphStyle(
+        "name", fontName=CJK, fontSize=16, leading=22,
+        spaceAfter=4, backColor=PINK,
+        leftIndent=6, rightIndent=6,
+    )
+    addr_style = ParagraphStyle(
+        "addr", fontName=CJK, fontSize=14, leading=20,
+        spaceAfter=3, leftIndent=6,
+    )
+    note_style = ParagraphStyle(
+        "note", fontName=CJK, fontSize=14, leading=20,
+        spaceAfter=3, textColor=colors.red, leftIndent=6,
+    )
+
+    # Group rows preserving insertion order。按 order_key（订单）分组，
+    # 而不是按 tracking 值分组——避免多个"暂无 Tracking"的不同订单被误合并到同一页
+    groups = OrderedDict()
+    for row in rows:
+        groups.setdefault(row["order_key"], []).append(row)
+
+    story = []
+    first_page = True
+
+    for order_key, items in groups.items():
+        if not first_page:
+            story.append(PageBreak())
+        first_page = False
+
+        tracking = items[0]["tracking"]
+        # 注意：CJK 字体不一定覆盖 emoji glyph，用纯文字提示，避免 PDF 里出现乱码/空字符
+        tracking_display = tracking if tracking else "暂无 Tracking No.（请先完成打包）"
+
+        # ── Tracking number (yellow highlight) ──
+        story.append(Paragraph(f"Tracking No.: {tracking_display}", tracking_style))
+        story.append(Spacer(1, 0.12*inch))
+
+        # ── Recipient name (pink highlight) + address ──
+        name    = items[0]["name"]
+        address = items[0]["address"]
+
+        story.append(Paragraph(name, name_style))
+        for line in address.split("\n"):
+            if line.strip():
+                story.append(Paragraph(line.strip(), addr_style))
+        story.append(Spacer(1, 0.2*inch))
+
+        # ── Product table (aggregate qty) ──
+        merged = {}
+        for item in items:
+            key = (item["product"], item["location"], item["size"])
+            merged[key] = merged.get(key, 0) + 1
+
+        table_data = [["款式", "库位", "尺码", "数量"]]
+        for (product, loc, sz), qty in merged.items():
+            table_data.append([product, loc, sz, str(qty)])
+
+        usable = 7.3 * inch  # letter width minus margins
+        col_widths = [usable * 0.50, usable * 0.25, usable * 0.13, usable * 0.12]
+        tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("FONTNAME",       (0, 0), (-1, -1), CJK),
+            ("FONTSIZE",       (0, 0), (-1,  0), 16),   # header row
+            ("FONTSIZE",       (0, 1), (-1, -1), 15),   # data rows
+            ("BACKGROUND",     (0, 0), (-1,  0), HEADER_BG),
+            ("TEXTCOLOR",      (0, 0), (-1,  0), colors.white),
+            ("ALIGN",          (0, 0), (-1, -1), "CENTER"),
+            ("ALIGN",          (0, 1), (0,  -1), "LEFT"),
+            ("GRID",           (0, 0), (-1, -1), 0.8, colors.HexColor("#AAAAAA")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.white, colors.HexColor("#F0F4F8")]),
+            ("TOPPADDING",     (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING",  (0, 0), (-1, -1), 10),
+            ("LEFTPADDING",    (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING",   (0, 0), (-1, -1), 8),
+        ]))
+        story.append(tbl)
+
+        # ── Notes ──
+        all_notes = list(dict.fromkeys(
+            item["note"] for item in items if item["note"]
+        ))
+        if all_notes:
+            story.append(Spacer(1, 0.15*inch))
+            for n in all_notes:
+                story.append(Paragraph(f"备注：{n}", note_style))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False, encoding="utf-8-sig")
+    return buf.getvalue()
+
+
+def extract_date_prefix(df: pd.DataFrame) -> str:
+    """Return MMDD string from the first non-empty 日期 value in the dataframe."""
+    try:
+        raw = df["日期"].dropna().iloc[0]
+        dt = pd.to_datetime(raw)
+        return dt.strftime("%m%d")
+    except Exception:
+        return ""
+
+
+def show_section(label: str, rows: list, key_prefix: str, date_prefix: str):
+    pick = make_pick_list(rows)
+    pick_name = f"{date_prefix}{label}水单拣货单.csv"
+    ship_name = f"{date_prefix}{label}水单发货单.pdf"
+
+    st.subheader(f"{label} — 拣货单")
+    st.dataframe(pick, use_container_width=True, hide_index=True)
+    st.download_button(
+        f"⬇ 下载{label}拣货单 CSV",
+        to_csv_bytes(pick),
+        pick_name,
+        "text/csv",
+        key=f"{key_prefix}_pick",
+    )
+
+    st.divider()
+    st.subheader(f"{label} — 发货单")
+    pdf_bytes = make_shipping_pdf(rows)
+    st.download_button(
+        f"⬇ 下载{label}发货单 PDF",
+        pdf_bytes,
+        ship_name,
+        "application/pdf",
+        key=f"{key_prefix}_ship",
+    )
+
+
+# 长数字列必须按文本读取，否则 pandas 会推断成 float64，
+# 18-22 位的 Tracking No. / Order ID 超出浮点精度会变成科学计数法（如 9.4e+21）
+_ID_LIKE_COLS = ["打包 Tracking No.", "查物流 Tracking No.", "Order ID",
+                 "Phone", "手机号", "手机号 (1)"]
+
+
+def read_file(f) -> pd.DataFrame:
+    name = f.name.lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(f, dtype={c: str for c in _ID_LIKE_COLS})
+    else:
+        df = pd.read_csv(f, dtype={c: str for c in _ID_LIKE_COLS})
+    for c in _ID_LIKE_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip().str.replace(
+                r"\.0$", "", regex=True
+            ).replace({"nan": "", "None": ""})
+    return df
 
 # ============================================================
 # Streamlit UI
@@ -1201,7 +1161,7 @@ st.title("💅 NailVesta 发货系统")
 
 tab1, tab2 = st.tabs([
     "1️⃣ 第一步：生成水单（发给打 Label 的人）",
-    "2️⃣ 第二步：拿到 Label PDF 后，核对 + 生成拣货单/发货单",
+    "2️⃣ 第二步：生成拣货单 CSV + 发货单 PDF",
 ])
 
 # ============================================================
@@ -1401,154 +1361,51 @@ with tab1:
                     "Excel 打开不会丢失前导零或 Order ID 转科学计数法"
                 )
 
+
 # ============================================================
-# Tab 2: 核对 + 拣货单 + 发货单
+# Tab 2: 拣货单 & 发货单生成器（原独立程序全功能移植）
 # ============================================================
 with tab2:
-    st.subheader("第 2 步 · 核对面单 + 生成拣货单/发货单")
+    st.subheader("第 2 步 · 拣货单 & 发货单生成器")
     st.caption(
-        "上传 Lark CSV + 图册 + Label PDF → 自动核对 + 生成拣货单/发货单。"
-        "Return Label 勾选订单仍参与正常发货拣货；顾客寄回给我们的 Return Label 本身不需要拣货。"
-        "面单核对建议只上传正常发货 Label PDF，不要把寄回 Return Label PDF 混在一起。"
+        "上传当日的 客人水单 CSV / 深度达人单 CSV（可只传其一）→ "
+        "下载拣货单 CSV（按库位汇总）+ 发货单 PDF（按 Tracking No. 一单一页）"
     )
 
-    c_left, c_right = st.columns(2)
-    with c_left:
-        lark_file_2 = st.file_uploader("Lark 水单 CSV", type=["csv"], key="lark2")
-        catalog_file_2 = st.file_uploader("产品图册 CSV", type=["csv"], key="cat2")
-    with c_right:
-        label_pdf = st.file_uploader("Label PDF（打 Label 后拿到的面单）", type=["pdf"], key="pdf2")
-
-    if lark_file_2 is None or catalog_file_2 is None:
-        st.info("👆 请上传 Lark CSV 和产品图册 CSV")
+    if not REPORTLAB_OK:
+        st.error("缺少 reportlab 依赖：请在 requirements.txt 加入 reportlab 后重新部署")
         st.stop()
 
-    df2 = load_lark_data(lark_file_2.read())
-    warn_if_corrupted_order_ids(df2)
-    catalog2 = load_catalog(catalog_file_2.read())
+    col_c, col_i = st.columns(2)
 
-    all_dates_2 = sorted(
-        [d for d in df2["日期"].dropna().unique()
-         if re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", str(d))],
-        key=lambda x: datetime.strptime(x, "%Y/%m/%d"), reverse=True,
-    )
-    if not all_dates_2:
-        st.error("CSV 中找不到合法日期")
-        st.stop()
-
-    sel_date_2 = st.selectbox(
-        "发货日期", options=all_dates_2, index=0,
-        format_func=lambda x: f"{x} {'⬅️ 最新' if x == all_dates_2[0] else ''}",
-        key="d2",
-    )
-    orders_2_all = filter_orders_for_date(df2, sel_date_2)
-
-    split_2 = split_orders_by_type(orders_2_all)
-    return_count_2 = len(split_2["return_label_kol"]) + len(split_2["return_label_cust"])
-    orders_2 = pd.concat([split_2["kol"], split_2["customer"]], ignore_index=False)
-
-    if return_count_2 > 0:
-        st.info(
-            f"ℹ️ 已保留 {return_count_2} 单 Return Label 勾选订单参与正常发货拣货"
-            f"（{len(split_2['return_label_kol'])} 深度达人 + "
-            f"{len(split_2['return_label_cust'])} 客户）。"
-            "寄回给我们的 Return Label 本身不需要拣货；面单核对请上传正常发货 Label PDF。"
+    with col_c:
+        customer_file = st.file_uploader(
+            "上传客人水单 CSV", type=["csv"], key="customer_upload"
         )
 
-    exploded_2 = explode_orders(orders_2, catalog2)
+    with col_i:
+        influencer_file = st.file_uploader(
+            "上传深度达人单 CSV", type=["csv"], key="influencer_upload"
+        )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("待发货订单", len(orders_2))
-    m2.metric("拣货行数", len(exploded_2),
-              delta=f"+{len(exploded_2)-len(orders_2)} 组合装"
-                    if len(exploded_2) > len(orders_2) else None)
-    m3.metric("拣货库位",
-              exploded_2["库位"].replace("", pd.NA).dropna().nunique() if len(exploded_2) else 0)
-
-    if len(orders_2) == 0:
-        st.warning(f"⚠️ {sel_date_2} 没有需要拣货的订单")
-        st.stop()
-
-    # ---- 面单核对 ----
-    if label_pdf is not None:
-        st.divider()
-        st.subheader("🔍 面单核对结果")
-        has_tess, has_popp = check_ocr_available()
-        if not (has_tess and has_popp):
-            st.error(
-                "OCR 未启用：服务器缺少 tesseract / poppler-utils。"
-                "本地：`brew install tesseract poppler` 或 `apt install tesseract-ocr poppler-utils`。"
-                "Streamlit Cloud：在仓库根目录的 `packages.txt` 加上 `tesseract-ocr` 和 `poppler-utils`。"
-            )
-        else:
-            with st.spinner("OCR 解析 PDF 中（每页约 1-2 秒）..."):
-                try:
-                    labels = parse_label_pdf(label_pdf.read())
-                    rec = reconcile_labels(orders_2, labels)
-                except Exception as e:
-                    st.error(f"PDF 解析失败：{e}")
-                    rec = None
-
-            if rec is not None:
-                ok = (rec["状态"] == "✅ 一致").sum()
-                warn = rec["状态"].str.startswith("⚠️").sum()
-                bad = rec["状态"].str.startswith("❌").sum()
-                cc1, cc2, cc3 = st.columns(3)
-                cc1.metric("✅ 一致", ok)
-                cc2.metric("⚠️ 警告", warn)
-                cc3.metric("❌ 不一致", bad)
-
-                def color_status(val):
-                    if val.startswith("✅"): return "background-color: #d4edda"
-                    if val.startswith("⚠️"): return "background-color: #fff3cd"
-                    if val.startswith("❌"): return "background-color: #f8d7da"
-                    return ""
-                styled = rec.style.map(color_status, subset=["状态"])
-                st.dataframe(styled, use_container_width=True, height=400)
-
-                if bad == 0 and warn == 0:
-                    st.success(f"🎉 所有 {len(rec)} 单面单核对通过，可以发货！")
-                elif bad > 0:
-                    st.error(f"⚠️ {bad} 单严重不一致，请人工核对再发货")
-
-    # ---- 生成拣货单 + 发货单 ----
     st.divider()
-    st.subheader("📦 生成拣货单 + 发货单")
 
-    if catalog2 is not None:
-        missing = exploded_2[(exploded_2["中文名"] == "") & (exploded_2["英文款式"] != "")]
-        if len(missing) > 0:
-            unmatched = missing["英文款式"].unique().tolist()
-            st.warning(
-                f"⚠️ {len(missing)} 行未在图册匹配到："
-                + ", ".join(unmatched[:10]) + ("..." if len(unmatched) > 10 else "")
-            )
+    if customer_file:
+        df_c = read_file(customer_file)
+        warn_if_corrupted_tracking(df_c)
+        rows_c = parse_customer_rows(df_c)
+        date_c = extract_date_prefix(df_c)
+        st.markdown("## 客人水单")
+        show_section("客人", rows_c, "c", date_c)
+        st.divider()
 
-    with st.expander("👀 拣货明细预览", expanded=False):
-        st.dataframe(
-            exploded_2[["Order ID","中文名","英文款式","SKU","Size","库位"]],
-            use_container_width=True, height=300,
-        )
+    if influencer_file:
+        df_i = read_file(influencer_file)
+        warn_if_corrupted_tracking(df_i)
+        rows_i = parse_influencer_rows(df_i)
+        date_i = extract_date_prefix(df_i)
+        st.markdown("## 深度达人单")
+        show_section("达人", rows_i, "i", date_i)
 
-    if st.button("✨ 生成拣货单 + 发货单", type="primary", use_container_width=True):
-        with st.spinner("生成中..."):
-            picking_csv = build_picking_summary_csv(exploded_2)
-            slip_csv = build_packing_slip_csv(exploded_2, sel_date_2)
-        st.success(f"✅ 已生成 {sel_date_2} 的发货文件")
-
-        date_compact = sel_date_2.replace("/", "")
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            st.download_button(
-                "📋 拣货单（按库位汇总）",
-                data=picking_csv,
-                file_name=f"拣货单_{date_compact}.csv",
-                mime="text/csv", use_container_width=True,
-            )
-        with cc2:
-            st.download_button(
-                "📦 发货单 / Packing Slip",
-                data=slip_csv,
-                file_name=f"发货单_{date_compact}.csv",
-                mime="text/csv", use_container_width=True,
-            )
+    if not customer_file and not influencer_file:
+        st.info("请上传客人水单或深度达人单 CSV 文件以生成报表。")
