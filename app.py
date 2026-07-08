@@ -45,28 +45,20 @@ SENDER_INFO = {
     "zip": "90071", "address": "515 S Flower St, Floor 18 & 19, STE 1901",
 }
 PACKAGE_DEFAULTS = {
-    "logistics_product": "USPS-1", "box_count": 1, "gross_weight": 1,
-    "net_weight": "0.3", "length": "20", "width": "15", "height": "2",
+    "logistics_product": "USPS-1",
+    "length": "20", "width": "15", "height": "2", "weight": "0.3",
+    "declare_price": 5, "net_weight": "0.3",
+    "cn_name": "穿戴甲", "en_name": "Press-On Nails", "qty": 1,
 }
 
-# —— 水单 Excel 模板（对齐物流商 "FBA-多票批量导入-按总箱数" 批量导入模版）——
-SHUIDAN_TEMPLATE_TITLE = "FBA-多票批量导入-按总箱数-模版"
-SHUIDAN_TEMPLATE_NOTE = (
-    "1、币种 - 是指申报币种，只需要填写币种的国际编号。如：人民币对应CNY/美元对应USD/英磅对应GBP/欧元对应EUR/日元对应JPY\n"
-    "2、尺寸/重量单位 - 是指 采用英制还是公制单位，只需要填写 英制或公制即可。其中：公制单位为  重量:公斤/尺寸:厘米 ；英制单位为 重量:磅/尺寸:英寸\n"
-    "3、收件人公司需要填写FBA的仓库代码。若收件人名称填写“Amazon”，则收件人公司必须填写FBA仓库代码并且收件人省州、城市、地址、邮编可留空。\n"
-    "4、运输方式填写的是物流产品编码；同一票货，不允许采用不同的运输方式。\n"
-    "5、一票多箱的订单，如果箱规不一样，需要分多行填写。通过客户单号/入仓单号关联，表示是同一票货。\n"
-    "6、支持多个FBA订单同时导入\n"
-    "7、箱子(件)的长宽高和重量不填则默认为10。"
-)
+# —— 水单 Excel 模板（对齐物流商 "[HLT]-通用导入" 模版，26 列 A-Z，列名不可改）——
 SHUIDAN_HEADERS = [
-    "客户单号/入库单号", "RefNo2", "RefNo3", "签名服务", "子客户单号",
-    "物流产品", "箱数(件数)", "毛重/箱", "净重/箱", "长/箱", "宽/箱", "高/箱",
-    "收件人名称", "收件人公司/FBA仓库编码", "收件人国家", "收件人州/省", "收件人城市",
-    "收件人地址", "收件人电话", "收件人邮编",
-    "发件人名称", "发件人公司", "发件人国家", "发件人州/省", "发件人城市",
-    "发件人地址", "发件人电话", "发件人邮编",
+    "客户订单号", "物流产品(产品编号)",
+    "发件人姓名", "发件人国家", "发件人城市", "发件人省/州", "发件人邮编", "发件人地址",
+    "收件人姓名", "收件人国家", "收件人城市", "收件人省/州", "收件人邮编", "收件人电话",
+    "收件人地址一", "收件人地址二",
+    "长(cm)", "宽(cm)", "高(cm)", "重量(kg)",
+    "配货备注1", "申报单价1", "单位净重1", "中文品名1", "英文品名1", "数量1",
 ]
 SIZE_COL = "Size'"
 RETURN_LABEL_COL = "Return Label 包裹"
@@ -479,6 +471,25 @@ def load_lark_data(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+def count_corrupted_order_ids(df: pd.DataFrame) -> int:
+    """检测被 Excel 打开保存过的 CSV：Order ID 变成科学计数法(5.77E+17)，末位精度已永久丢失"""
+    if "Order ID" not in df.columns:
+        return 0
+    s = df["Order ID"].dropna().astype(str)
+    return int(s.str.contains(r"[eE]\+", regex=True).sum())
+
+
+def warn_if_corrupted_order_ids(df: pd.DataFrame):
+    bad = count_corrupted_order_ids(df)
+    if bad > 0:
+        st.error(
+            f"🚨 检测到 {bad} 行 Order ID 是科学计数法（如 5.77E+17）——"
+            "这份 CSV 曾被 Excel 打开并保存过，18 位订单号末尾已永久丢失，"
+            "水单会打错单号、面单核对会全部对不上。"
+            "请回 Lark 重新导出 CSV 直接上传，不要用 Excel 打开后另存。"
+        )
+
+
 @st.cache_data(show_spinner=False)
 def load_catalog(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(file_bytes))
@@ -798,7 +809,10 @@ def explode_orders(orders, catalog):
                 "达人Name": _get_kol_name(r),
                 "Handle": _clean_str(r.get("Handle")),
                 "地址_raw": _clean_str(r.get("地址")),
-                "備註": _clean_str(r.get("備註")),
+                # Lark 表同时存在繁体「備註」和简体「备注」两列，都带入发货单
+                "備註": " | ".join(dict.fromkeys(
+                    x for x in (_clean_str(r.get("備註")), _clean_str(r.get("备注"))) if x
+                )),
                 "手机号_raw": _clean_str(r.get("手机号")) or _clean_str(r.get("手机号 (1)")),
             })
     return pd.DataFrame(rows)
@@ -892,11 +906,12 @@ def _combine_address(street: str, street2: str) -> str:
     return street or street2
 
 
-# 喷黄高亮的固定列（与物流商模版一致，空白列也要标黄）
-# 正常发货：C-L 箱规区 + N/O 收件人公司国家 + U-AB 发件人(NailVesta)整段
-FIXED_COLS_NORMAL = set(range(3, 13)) | {14, 15} | set(range(21, 29))
-# Return Label：C-T 箱规区 + 收件人(NailVesta)整段；发件人=顾客不标黄
-FIXED_COLS_RETURN = set(range(3, 21))
+# 喷黄高亮的固定列（1-indexed，对应 [HLT]-通用导入 26 列；空白固定列也标黄）
+# 正常发货：B 物流产品 + C-H 发件人(NailVesta)整段 + J 收件人国家
+#          + Q-T 长宽高重量 + V-Z 申报单价/净重/品名/数量
+FIXED_COLS_NORMAL = {2} | set(range(3, 9)) | {10} | set(range(17, 21)) | set(range(22, 27))
+# Return Label：B 物流产品 + I-P 收件人(NailVesta)整段 + Q-T + V-Z；发件人=顾客不标黄
+FIXED_COLS_RETURN = {2} | set(range(9, 21)) | set(range(22, 27))
 
 
 def _write_shuidan_workbook(rows_data: list, fixed_cols: set) -> bytes:
@@ -905,67 +920,20 @@ def _write_shuidan_workbook(rows_data: list, fixed_cols: set) -> bytes:
     from openpyxl.utils import get_column_letter
 
     n_cols = len(SHUIDAN_HEADERS)
-    last_col = get_column_letter(n_cols)
-
-    title_fill = PatternFill("solid", fgColor="0070C0")
-    note_fill = PatternFill("solid", fgColor="D9D9D9")
-    section_fill = PatternFill("solid", fgColor="DCE6F1")
     fixed_fill = PatternFill("solid", fgColor="FFFF00")
 
     wb = Workbook()
     ws = wb.active
     ws.title = "sheet1"
 
-    # 第 1 行：标题
-    ws.merge_cells(f"A1:{last_col}1")
-    ws["A1"] = SHUIDAN_TEMPLATE_TITLE
-    ws["A1"].font = Font(name="微软雅黑", size=16, bold=True, color="FFFFFF")
-    ws["A1"].fill = title_fill
-    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[1].height = 28
-
-    # 第 2 行：模板说明
-    ws["A2"] = "模板说明："
-    ws["A2"].font = Font(name="微软雅黑", size=12, bold=True)
-    ws["A2"].fill = note_fill
-    ws["A2"].alignment = Alignment(horizontal="left", vertical="center")
-    ws.merge_cells(f"B2:{last_col}2")
-    ws["B2"] = SHUIDAN_TEMPLATE_NOTE
-    ws["B2"].font = Font(name="微软雅黑", size=12, color="FF0000")
-    ws["B2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    ws.row_dimensions[2].height = 110
-
-    # 第 3 行：币种 / 尺寸重量单位
-    ws["A3"] = "币种:"
-    ws["C3"] = "尺寸/重量单位:"
-    ws["A3"].fill = note_fill
-    ws["C3"].fill = note_fill
-    ws["B3"] = "USD"
-    ws["D3"] = "英制"
-    ws.merge_cells("E3:Q3")
-    for coord in ("A3", "B3", "C3", "D3"):
-        ws[coord].font = Font(name="微软雅黑", size=12)
-        ws[coord].alignment = Alignment(horizontal="left", vertical="center")
-
-    # 第 4 行：分组标题
-    ws.merge_cells("A4:L4"); ws["A4"] = "订单信息"
-    ws.merge_cells("M4:T4"); ws["M4"] = "收件人信息"
-    ws.merge_cells(f"U4:{last_col}4"); ws["U4"] = "发件人信息"
-    for coord in ("A4", "M4", "U4"):
-        cell = ws[coord]
-        cell.font = Font(name="微软雅黑", size=12, bold=True)
-        cell.fill = section_fill
-        cell.alignment = Alignment(horizontal="left", vertical="center")
-
-    # 第 5 行：列头
+    # 第 1 行：列头（与 HLT 模板一致，单行表头，列名不可改）
     for c, h in enumerate(SHUIDAN_HEADERS, 1):
-        cell = ws.cell(row=5, column=c, value=h)
-        cell.font = Font(name="微软雅黑", size=12, color="FF0000")
-        cell.fill = section_fill
-        cell.alignment = Alignment(horizontal="left", vertical="center")
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font = Font(name="宋体", size=11, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 第 6 行起：数据。固定列（含空白列）整列标黄
-    for r_idx, row_vals in enumerate(rows_data, 6):
+    # 第 2 行起：数据。固定列（含空白列）整列标黄
+    for r_idx, row_vals in enumerate(rows_data, 2):
         for c, val in enumerate(row_vals, 1):
             cell = ws.cell(row=r_idx, column=c, value=val)
             is_fixed = c in fixed_cols
@@ -974,9 +942,10 @@ def _write_shuidan_workbook(rows_data: list, fixed_cols: set) -> bytes:
                 cell.fill = fixed_fill
 
     # 防止长订单号/电话/邮编被 Excel 转成科学计数法或丢掉前导零
-    text_cols = [1, 9, 10, 11, 12, 19, 20, 27, 28]
+    # A 客户订单号 / G 发件人邮编 / M 收件人邮编 / N 收件人电话
+    text_cols = [1, 7, 13, 14]
     for col_idx in text_cols:
-        for row in ws.iter_rows(min_row=6, min_col=col_idx, max_col=col_idx):
+        for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
             for cell in row:
                 cell.number_format = "@"
 
@@ -993,18 +962,17 @@ def build_shuidan_xlsx(orders: pd.DataFrame) -> bytes:
     rows_data = []
     for _, r in orders.iterrows():
         recip = get_recipient_info(r)
-        recip_addr = _combine_address(recip["street"], recip.get("street2", ""))
         rows_data.append([
-            r["Order ID"], None, None, None, None,
-            PACKAGE_DEFAULTS["logistics_product"], PACKAGE_DEFAULTS["box_count"],
-            PACKAGE_DEFAULTS["gross_weight"], PACKAGE_DEFAULTS["net_weight"],
-            PACKAGE_DEFAULTS["length"], PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
-            recip["name"], None, "US",
-            state_to_abbr(recip["state"]), recip["city"],
-            recip_addr, recip["phone"], recip["zip"],
-            SENDER_INFO["name"], None, SENDER_INFO["country"],
-            SENDER_INFO["state"], SENDER_INFO["city"],
-            SENDER_INFO["address"], SENDER_INFO["phone"], SENDER_INFO["zip"],
+            r["Order ID"], PACKAGE_DEFAULTS["logistics_product"],
+            SENDER_INFO["name"], SENDER_INFO["country"], SENDER_INFO["city"],
+            SENDER_INFO["state"], SENDER_INFO["zip"], SENDER_INFO["address"],
+            recip["name"], "US", recip["city"],
+            state_to_abbr(recip["state"]), recip["zip"], recip["phone"],
+            recip["street"], recip.get("street2") or None,
+            PACKAGE_DEFAULTS["length"], PACKAGE_DEFAULTS["width"],
+            PACKAGE_DEFAULTS["height"], PACKAGE_DEFAULTS["weight"],
+            None, PACKAGE_DEFAULTS["declare_price"], PACKAGE_DEFAULTS["net_weight"],
+            PACKAGE_DEFAULTS["cn_name"], PACKAGE_DEFAULTS["en_name"], PACKAGE_DEFAULTS["qty"],
         ])
     return _write_shuidan_workbook(rows_data, FIXED_COLS_NORMAL)
 
@@ -1014,18 +982,19 @@ def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
     rows_data = []
     for _, r in orders.iterrows():
         sender = get_recipient_info(r)
+        # HLT 模板发件人只有一个地址栏，地址一/地址二合并
         sender_addr = _combine_address(sender["street"], sender.get("street2", ""))
         rows_data.append([
-            r["Order ID"], None, None, None, None,
-            PACKAGE_DEFAULTS["logistics_product"], PACKAGE_DEFAULTS["box_count"],
-            PACKAGE_DEFAULTS["gross_weight"], PACKAGE_DEFAULTS["net_weight"],
-            PACKAGE_DEFAULTS["length"], PACKAGE_DEFAULTS["width"], PACKAGE_DEFAULTS["height"],
-            SENDER_INFO["name"], None, "US",
-            SENDER_INFO["state"], SENDER_INFO["city"],
-            SENDER_INFO["address"], SENDER_INFO["phone"], SENDER_INFO["zip"],
-            sender["name"], None, "US",
-            state_to_abbr(sender["state"]), sender["city"],
-            sender_addr, sender["phone"], sender["zip"],
+            r["Order ID"], PACKAGE_DEFAULTS["logistics_product"],
+            sender["name"], "US", sender["city"],
+            state_to_abbr(sender["state"]), sender["zip"], sender_addr,
+            SENDER_INFO["name"], SENDER_INFO["country"], SENDER_INFO["city"],
+            SENDER_INFO["state"], SENDER_INFO["zip"], SENDER_INFO["phone"],
+            SENDER_INFO["address"], None,
+            PACKAGE_DEFAULTS["length"], PACKAGE_DEFAULTS["width"],
+            PACKAGE_DEFAULTS["height"], PACKAGE_DEFAULTS["weight"],
+            None, PACKAGE_DEFAULTS["declare_price"], PACKAGE_DEFAULTS["net_weight"],
+            PACKAGE_DEFAULTS["cn_name"], PACKAGE_DEFAULTS["en_name"], PACKAGE_DEFAULTS["qty"],
         ])
     return _write_shuidan_workbook(rows_data, FIXED_COLS_RETURN)
 
@@ -1144,16 +1113,24 @@ def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
 
         lbl = label_by_oid.get(oid)
         is_kol_oid = oid.startswith("KOL-")
-        if not lbl and is_kol_oid:
+        # Order ID 被 Excel 存成科学计数法(5.77E+17)时同样无法按单号匹配
+        is_corrupted_oid = bool(re.search(r"[eE]\+", oid))
+        matched_by_name = False
+        if not lbl and (is_kol_oid or is_corrupted_oid):
             lbl = match_by_name_zip(lark_name, lark_zip)
+            matched_by_name = lbl is not None
         if not lbl:
+            if is_kol_oid:
+                miss_note = "达人单无数字单号，按姓名+邮编也未在 PDF 中找到面单"
+            elif is_corrupted_oid:
+                miss_note = "Order ID 已损坏(科学计数法)，按姓名+邮编也未找到面单；请重新导出 CSV"
+            else:
+                miss_note = "PDF 中找不到此订单的面单"
             rows.append({
                 "Order ID": oid, "状态": "❌ 缺面单",
                 "Lark 收件人": lark_name, "Label 收件人": "—",
                 "Lark 邮编": lark_zip, "Label 末行": "—",
-                "Tracking": "—",
-                "备注": "达人单无数字单号，按姓名+邮编也未在 PDF 中找到面单"
-                        if is_kol_oid else "PDF 中找不到此订单的面单",
+                "Tracking": "—", "备注": miss_note,
             })
             continue
         matched_pages.add(lbl["page"])
@@ -1179,6 +1156,9 @@ def reconcile_labels(orders: pd.DataFrame, labels: list) -> pd.DataFrame:
         else:
             status = "❌ 不匹配"
             note = f"Lark={lark_name} {lark_zip} | Label={lbl['name']} {last_line}"
+
+        if matched_by_name and is_corrupted_oid:
+            note = ("Order ID 已损坏，按姓名+邮编匹配到面单；建议重新导出 CSV。" + note).strip("。 ")
 
         rows.append({
             "Order ID": oid, "状态": status,
@@ -1239,6 +1219,7 @@ with tab1:
         st.info("👆 请上传 Lark CSV")
     else:
         df1 = load_lark_data(lark_file_1.read())
+        warn_if_corrupted_order_ids(df1)
         all_dates_1 = sorted(
             [d for d in df1["日期"].dropna().unique()
              if re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", str(d))],
@@ -1443,6 +1424,7 @@ with tab2:
         st.stop()
 
     df2 = load_lark_data(lark_file_2.read())
+    warn_if_corrupted_order_ids(df2)
     catalog2 = load_catalog(catalog_file_2.read())
 
     all_dates_2 = sorted(
