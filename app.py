@@ -78,6 +78,51 @@ SHUIDAN_HEADERS = [
 SIZE_COL = "Size'"
 RETURN_LABEL_COL = "Return Label 包裹"
 
+# —— 深达水单 CSV 模板（对齐 USPS_Template_final，59 列，列名/顺序不可改）——
+# 必填列分两类（对应模板里的喷黄/喷绿）：
+#   KOL_USPS_FIXED_COLS  = 喷黄：所有行同一个值（发件人信息/包裹规格等）
+#   KOL_USPS_VARIABLE_COLS = 喷绿：逐单从 Lark 深达 CSV 解析
+KOL_USPS_HEADERS = [
+    "Reference ID", "Reference ID 2", "Shipping Date", "Item Description",
+    "Item Quantity", "Item Weight (lb)", "Item Weight (oz)", "Item Value",
+    "HS Tariff #", "Country of Origin",
+    "Sender First Name", "Sender Middle Initial", "Sender Last Name",
+    "Sender Company/Org Name", "Sender Address Line 1", "Sender Address Line 2",
+    "Sender Address Line 3", "Sender Address Town/City", "Sender State",
+    "Sender Country", "Sender ZIP Code", "Sender Urbanization Code",
+    "Ship From Another ZIP Code", "Sender Email", "Sender Cell Phone",
+    "Recipient Country", "Recipient First Name", "Recipient Middle Initial",
+    "Recipient Last Name", "Recipient Company/Org Name",
+    "Recipient Address Line 1", "Recipient Address Line 2", "Recipient Address Line 3",
+    "Recipient Address Town/City", "Recipient Province", "Recipient State",
+    "Recipient ZIP Code", "Recipient Urbanization Code", "Recipient Phone",
+    "Recipient Email", "Service Type", "Package Type",
+    "Package Weight (lb)", "Package Weight (oz)", "Length", "Width", "Height",
+    "Girth", "Insured Value", "Contents", "Contents Description",
+    "Package Comments", "Customs Form Reference #", "License #",
+    "Certificate #", "Invoice #", "Customs Form Reference # Type",
+    "HAZMAT Type", "Live Animals and Perishable Goods Indicator",
+]
+KOL_USPS_FIXED_VALUES = {
+    "Sender Company/Org Name": "NailVesta",
+    "Sender Address Line 1": "515 S Flower St",
+    "Sender Address Line 2": "Floor 18 & 19, STE 1901",
+    "Sender Address Town/City": "Los Angeles",
+    "Sender State": "CA",
+    "Sender Country": "US",
+    "Sender ZIP Code": "90071",
+    "Sender Email": "contact@nailvesta.com",
+    "Sender Cell Phone": "5105089943",
+    "Recipient Country": "US",
+    "Service Type": "USPS Ground Advantage",
+    "Package Type": "Choose Your Own Box",
+    "Package Weight (lb)": 0.25,
+    "Package Weight (oz)": 4,
+    "Length": 7.87,
+    "Width": 5.91,
+    "Height": 0.79,
+}
+
 # 需要强制按文本读取的列（防止长数字被读成 float 丢精度）
 TEXT_COLUMNS = [
     "Order ID", "Phone", "手机号", "手机号 (1)",
@@ -248,7 +293,9 @@ def parse_free_address(text: str) -> dict:
                     last_idx = i; break
                 if wc in apt_kw:
                     j = i + 1
-                    while j < len(words) and re.match(r"^[\d\w\.\-#]+$", words[j]) and not (words[j] and words[j][0].isupper()):
+                    # 单元号紧跟在 apt/unit/suite 之后，可能是数字、字母(如 "Unit C")
+                    # 或两者组合(如 "12B")，不能因为它是大写字母就误判成城市名的开头
+                    if j < len(words) and re.fullmatch(r"[A-Za-z0-9]{1,5}\.?#?", words[j]):
                         j += 1
                     last_idx = j - 1 if j > i + 1 else i
                     break
@@ -651,7 +698,9 @@ def _format_original_address(row) -> str:
 
 def validate_address_info(row, label_kind: str = "正常发货") -> list:
     info = get_recipient_info(row)
-    role = "收件人" if label_kind == "正常发货" else "发件人"
+    # Return Label 里 get_recipient_info 拿到的是"寄件人"（顾客/达人寄回给我们）；
+    # 正常发货 / 深达 USPS 里拿到的都是"收件人"
+    role = "发件人" if label_kind == "Return Label" else "收件人"
     issues = []
 
     def add_issue(field, message, level="严重"):
@@ -831,6 +880,43 @@ def build_return_label_xlsx(orders: pd.DataFrame) -> bytes:
             PACKAGE_DEFAULTS["cn_name"], PACKAGE_DEFAULTS["en_name"], PACKAGE_DEFAULTS["qty"],
         ])
     return _write_shuidan_workbook(rows_data, FIXED_COLS_RETURN)
+
+
+def _split_kol_name(full_name: str) -> tuple:
+    """USPS 模板要拆 First/Last Name；取第一个词做 First，剩余做 Last。"""
+    parts = str(full_name or "").strip().split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def build_kol_usps_csv(orders: pd.DataFrame, ship_date_str: str) -> bytes:
+    """深达水单：对齐 USPS_Template_final 59 列，喷黄=固定值，喷绿=逐单解析"""
+    try:
+        ship_date = datetime.strptime(ship_date_str, "%Y/%m/%d").strftime("%m/%d/%Y")
+    except ValueError:
+        ship_date = ship_date_str
+
+    rows = []
+    for _, r in orders.iterrows():
+        recip = get_recipient_info(r)
+        first, last = _split_kol_name(recip["name"])
+        row = {h: None for h in KOL_USPS_HEADERS}
+        row.update(KOL_USPS_FIXED_VALUES)
+        row["Shipping Date"] = ship_date
+        row["Recipient First Name"] = first
+        row["Recipient Last Name"] = last
+        row["Recipient Address Line 1"] = recip["street"]
+        row["Recipient Address Town/City"] = recip["city"]
+        row["Recipient State"] = state_to_abbr(recip["state"])
+        row["Recipient ZIP Code"] = recip["zip"]
+        row["Recipient Phone"] = recip["phone"]
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=KOL_USPS_HEADERS)
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 # ============================================================================
@@ -1359,6 +1445,76 @@ with tab1:
                 st.caption(
                     "💡 已强制邮编/电话/Order ID 为文本格式，"
                     "Excel 打开不会丢失前导零或 Order ID 转科学计数法"
+                )
+
+    # ============================================================
+    # 深达水单（USPS 批量导入 CSV）—— 独立可选通道，不上传不报错
+    # ============================================================
+    st.divider()
+    st.markdown("### 🌟 深达水单（USPS 批量导入格式，可选）")
+    st.caption(
+        "上传 Lark 深达水单 CSV → 选日期 → 下载 USPS 模板格式的深达水单 CSV。"
+        "不上传这里不影响上面的客人水单生成。"
+    )
+
+    lark_file_kol = st.file_uploader(
+        "Lark 深达水单 CSV（不上传则跳过）", type=["csv"], key="lark_kol"
+    )
+
+    if lark_file_kol is not None:
+        df_kol = load_lark_data(lark_file_kol.read())
+        warn_if_corrupted_order_ids(df_kol)
+        all_dates_kol = sorted(
+            [d for d in df_kol["日期"].dropna().unique()
+             if re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", str(d))],
+            key=lambda x: datetime.strptime(x, "%Y/%m/%d"), reverse=True,
+        )
+        if not all_dates_kol:
+            st.error("深达 CSV 中找不到合法日期")
+        else:
+            sel_date_kol = st.selectbox(
+                "深达发货日期（默认最晚）",
+                options=all_dates_kol, index=0,
+                format_func=lambda x: f"{x} {'⬅️ 最新' if x == all_dates_kol[0] else ''}",
+                key="d_kol",
+            )
+            orders_kol_all = filter_orders_for_date(df_kol, sel_date_kol)
+            orders_kol = orders_kol_all[orders_kol_all.apply(is_kol_order, axis=1)]
+
+            st.metric("当日深达单", len(orders_kol))
+
+            if len(orders_kol) == 0:
+                st.warning(f"⚠️ {sel_date_kol} 没有深达订单")
+            else:
+                kol_issues = build_address_issue_report(orders_kol, label_kind="深达 USPS")
+                if len(kol_issues) > 0:
+                    serious_cnt = (kol_issues["问题等级"] == "严重").sum()
+                    remind_cnt = (kol_issues["问题等级"] == "提醒").sum()
+                    st.warning(
+                        f"⚠️ 地址信息检查发现 {len(kol_issues)} 条问题："
+                        f"{serious_cnt} 条严重 / {remind_cnt} 条提醒。"
+                    )
+                    with st.expander("🚨 查看深达地址问题明细", expanded=True):
+                        show_cols = [
+                            "影响Label", "订单号", "客诉类型", "问题等级", "问题字段", "问题说明",
+                            "解析姓名", "解析电话", "解析地址一", "解析地址二",
+                            "解析城市", "解析州", "解析邮编", "原始地址信息",
+                        ]
+                        st.dataframe(
+                            kol_issues[[c for c in show_cols if c in kol_issues.columns]],
+                            use_container_width=True, height=320, hide_index=True,
+                        )
+                else:
+                    st.success("✅ 深达地址信息检查通过。")
+
+                date_compact_kol = sel_date_kol.replace("/", "")
+                kol_usps_csv = build_kol_usps_csv(orders_kol, sel_date_kol)
+                st.download_button(
+                    f"🌟 下载深达水单 CSV（{len(orders_kol)} 单，USPS 格式）",
+                    data=kol_usps_csv,
+                    file_name=f"{date_compact_kol}深达水单_USPS.csv",
+                    mime="text/csv",
+                    type="primary", use_container_width=True, key="dl_kol_usps",
                 )
 
 
