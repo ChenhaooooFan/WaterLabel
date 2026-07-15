@@ -956,6 +956,12 @@ def extract_location(loc_field: str) -> str:
     return m.group(1).strip() if m else str(loc_field).strip()
 
 
+# 没有固定库位的杂项（Organizer Binder / Toolkits / Storage Box 等）在主表里
+# 库位字段本来就是空的，原正则要求 \S+（至少一个非空白字符）导致整条商品被 continue 跳过、
+# 完全不出现在拣货单/发货单里。用这个占位符替代"直接丢弃"。
+NO_LOCATION_LABEL = "无固定库位·人工核对"
+
+
 def split_shipping_info(raw: str) -> tuple:
     """Return (name, address) from multi-line Shipping Info.
     Format: Name / (+1)Phone / Street / City,State,Country / Zip
@@ -975,8 +981,9 @@ def is_blank(val: str) -> bool:
 
 # ── Parsers ──────────────────────────────────────────────────────────────────
 
-def parse_customer_rows(df: pd.DataFrame) -> list:
+def parse_customer_rows(df: pd.DataFrame, include_no_location: bool = True) -> tuple:
     rows = []
+    skipped = []  # [(收件人, 商品名)] 无固定库位且用户选择"不添加"时，记录下来提醒人工核对
     prev_tracking = prev_name = prev_address = prev_note = ""
     order_seq = 0  # 每遇到一个新地址块（非"同上"/非空）就是新订单，避免多单因 Tracking 同为空而被误合并成一页
 
@@ -1010,19 +1017,30 @@ def parse_customer_rows(df: pd.DataFrame) -> list:
         # Each entry format: "Product Name ｜ 库位：A-01-01"
         for part in loc_raw.split(","):
             part = part.strip()
+            if not part:
+                continue
             m = re.match(r"(.+?)\s*｜\s*库位：(\S+)", part)
             if m:
                 product = m.group(1).strip()
                 loc     = m.group(2).strip()
             else:
-                continue  # skip malformed entries
+                # 商品名能解析出来，但"库位："后面是空的（无固定库位的杂项）
+                m2 = re.match(r"(.+?)\s*｜\s*库位：\s*$", part)
+                if not m2:
+                    continue  # 真正的格式错误，跳过
+                product = m2.group(1).strip()
+                if not include_no_location:
+                    skipped.append((name, product))
+                    continue
+                loc = NO_LOCATION_LABEL
             rows.append(dict(tracking=tracking, order_key=order_seq, name=name, address=address,
                              product=product, location=loc, size=size, note=note))
-    return rows
+    return rows, skipped
 
 
-def parse_influencer_rows(df: pd.DataFrame) -> list:
+def parse_influencer_rows(df: pd.DataFrame, include_no_location: bool = True) -> tuple:
     rows = []
+    skipped = []  # [(达人Name, 商品名)]
     for idx, (_, r) in enumerate(df.iterrows()):
         size         = str(r.get("Size", "")).strip()
         loc_raw      = str(r.get("款式 + 库位", "")).strip()
@@ -1042,11 +1060,16 @@ def parse_influencer_rows(df: pd.DataFrame) -> list:
             if m:
                 product, loc = m.group(1).strip(), m.group(2).strip()
             else:
-                product, loc = entry, ""
+                m2 = re.match(r"(.+?)\s*｜\s*库位：\s*$", entry)
+                product = m2.group(1).strip() if m2 else entry
+                if not include_no_location:
+                    skipped.append((name, product))
+                    continue
+                loc = NO_LOCATION_LABEL
             # 每行 iterrows 本身就是一个独立订单，用行号做 order_key，Tracking 缺失也不会互相合并
             rows.append(dict(tracking=tracking, order_key=idx, name=name, address=address,
                              product=product, location=loc, size=size, note=note))
-    return rows
+    return rows, skipped
 
 
 # ── Pick list (CSV) ──────────────────────────────────────────────────────────
@@ -1065,7 +1088,9 @@ def make_pick_list(rows: list) -> pd.DataFrame:
     pivot["合计"] = pivot[["S", "M", "L"]].sum(axis=1)
     pivot = pivot[["location", "product", "S", "M", "L", "合计"]]
     pivot.columns = ["库位", "款式", "S", "M", "L", "合计"]
-    return pivot.sort_values(["库位", "款式"]).reset_index(drop=True)
+    pivot["_no_loc"] = pivot["库位"].eq(NO_LOCATION_LABEL)
+    return (pivot.sort_values(["_no_loc", "库位", "款式"])
+                 .drop(columns="_no_loc").reset_index(drop=True))
 
 
 # ── Shipping list (PDF) ──────────────────────────────────────────────────────
@@ -1544,23 +1569,42 @@ with tab2:
             "上传深度达人单 CSV", type=["csv"], key="influencer_upload"
         )
 
+    no_loc_choice = st.radio(
+        "无固定库位商品（Organizer Binder / Toolkits / Storage Box 等杂项）如何处理？",
+        ["✅ 添加 —— 正常计入拣货单/发货单，库位标注为「无固定库位·人工核对」",
+         "🚫 不添加 —— 从拣货单/发货单中剔除，但会列出清单提醒人工核对"],
+        index=0,
+        key="no_loc_choice",
+    )
+    include_no_location = no_loc_choice.startswith("✅")
+
     st.divider()
 
     if customer_file:
         df_c = read_file(customer_file)
         warn_if_corrupted_tracking(df_c)
-        rows_c = parse_customer_rows(df_c)
+        rows_c, skipped_c = parse_customer_rows(df_c, include_no_location)
         date_c = extract_date_prefix(df_c)
         st.markdown("## 客人水单")
+        if skipped_c:
+            st.warning(
+                "以下商品无固定库位、已从拣货单/发货单中剔除，请人工核对是否需要打包：\n"
+                + "\n".join(f"- {n}：{p}" for n, p in skipped_c)
+            )
         show_section("客人", rows_c, "c", date_c)
         st.divider()
 
     if influencer_file:
         df_i = read_file(influencer_file)
         warn_if_corrupted_tracking(df_i)
-        rows_i = parse_influencer_rows(df_i)
+        rows_i, skipped_i = parse_influencer_rows(df_i, include_no_location)
         date_i = extract_date_prefix(df_i)
         st.markdown("## 深度达人单")
+        if skipped_i:
+            st.warning(
+                "以下商品无固定库位、已从拣货单/发货单中剔除，请人工核对是否需要打包：\n"
+                + "\n".join(f"- {n}：{p}" for n, p in skipped_i)
+            )
         show_section("达人", rows_i, "i", date_i)
 
     if not customer_file and not influencer_file:
