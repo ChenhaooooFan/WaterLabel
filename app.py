@@ -990,7 +990,12 @@ def build_kol_usps_csv(orders: pd.DataFrame, ship_date_str: str) -> bytes:
 def _register_cjk_font() -> str:
     """Try to register a TTF font that covers all CJK (incl. traditional).
     Falls back to the built-in CID font if none found."""
+    _here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        # Font bundled in the repo — most reliable on Streamlit Cloud: needs no
+        # apt/packages.txt, and reportlab embeds (subsets) it into the PDF so
+        # labels print identically on any machine, even without CJK fonts.
+        os.path.join(_here, "NotoSansSC-Regular.ttf"),
         # Linux / Streamlit Cloud (install via packages.txt: fonts-noto-cjk)
         "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.otf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
