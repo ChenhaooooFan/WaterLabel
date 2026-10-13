@@ -712,6 +712,76 @@ def get_recipient_info(row) -> dict:
 
 
 # ============================================================
+# 同一收件人合并：人名 + 地址完全一样 = 同一个包裹 = 只打一张 label
+# ============================================================
+def _recipient_merge_key(row):
+    """人名和地址都一样才算同一个包裹（只忽略大小写和多余空格）。
+    姓名或街道解析不出来的行返回 None、不参与合并，避免几条坏地址被误并成一单。"""
+    info = get_recipient_info(row)
+    if not str(info["name"]).strip() or not str(info["street"]).strip():
+        return None
+    parts = [info["name"], info["street"], info.get("street2") or "",
+             info["city"], state_to_abbr(info["state"]), info["zip"]]
+    return tuple(re.sub(r"\s+", " ", str(p)).strip().casefold() for p in parts)
+
+
+def merge_orders_by_recipient(orders: pd.DataFrame) -> tuple:
+    """Lark 里同一个包裹常因款式/尺码不同拆成多条记录，水单里只能出一行，否则会多打 label、多付邮费。
+
+    每个收件人保留第一条记录；被并掉的记录里只要有一条勾了 Return Label，保留行也算勾选。
+    返回 (合并后的 orders, [{"name", "count", "order_ids"}])。
+    """
+    first_idx, groups = {}, {}
+    keep = []
+    for idx, r in orders.iterrows():
+        key = _recipient_merge_key(r)
+        if key is None or key not in first_idx:
+            keep.append(idx)
+            if key is not None:
+                first_idx[key] = idx
+                groups[key] = [idx]
+        else:
+            groups[key].append(idx)
+
+    out = orders.loc[keep].copy()
+    merged = []
+    for key, idxs in groups.items():
+        if len(idxs) == 1:
+            continue
+        head = idxs[0]
+        if RETURN_LABEL_COL in orders.columns and not is_return_label(out.at[head, RETURN_LABEL_COL]):
+            for i in idxs[1:]:
+                if is_return_label(orders.at[i, RETURN_LABEL_COL]):
+                    out.at[head, RETURN_LABEL_COL] = orders.at[i, RETURN_LABEL_COL]
+                    break
+        order_ids = list(dict.fromkeys(
+            oid for oid in (_order_no(orders.loc[i]) for i in idxs) if oid
+        ))
+        merged.append({
+            "name": get_recipient_info(orders.loc[head])["name"],
+            "count": len(idxs),
+            "order_ids": order_ids,
+        })
+    return out, merged
+
+
+def show_merge_notice(merged: list, n_before: int, n_after: int):
+    if not merged:
+        return
+    lines = []
+    for m in merged:
+        line = f"- {m['name']}：{m['count']} 条记录 → 1 张 label"
+        if len(m["order_ids"]) > 1:
+            line += f"（订单号不同：{'、'.join(m['order_ids'])}，水单里填的是第一个）"
+        lines.append(line)
+    st.info(
+        f"人名和地址完全一样的记录已合并成一个包裹、只打一张 label（{n_before} 条记录 → {n_after} 张 label）：\n"
+        + "\n".join(lines)
+        + "\n\n打完 label 后，请把这个 Tracking No. 填到该收件人的每一条记录上，第二步才能把它们合成一张发货单。"
+    )
+
+
+# ============================================================
 # 地址完整性校验
 # ============================================================
 def _is_blank_value(v) -> bool:
@@ -1073,9 +1143,13 @@ def parse_customer_rows(df: pd.DataFrame, include_no_location: bool = True) -> t
         else:
             name, address = prev_name, prev_address
 
-        # 同上 or blank tracking → inherit from previous row；仍为空则保留空，不臆造
-        if is_blank(tracking_raw) or tracking_raw == "同上":
+        # Tracking 只在"续行"（地址同上/留空）或明写"同上"时才沿用上一行。
+        # 自带地址但 Tracking 留空的新订单保留空——发货单现在按 Tracking 合页，
+        # 沿用上一单的号会把这单的货并进别人的包裹里
+        if tracking_raw == "同上" or (is_blank(tracking_raw) and not is_new_order):
             tracking = prev_tracking
+        elif is_blank(tracking_raw):
+            tracking = prev_tracking = ""
         else:
             tracking = tracking_raw
             prev_tracking = tracking
@@ -1165,6 +1239,33 @@ def make_pick_list(rows: list) -> pd.DataFrame:
 
 # ── Shipping list (PDF) ──────────────────────────────────────────────────────
 
+def group_rows_by_package(rows: list) -> "OrderedDict":
+    """发货单分页依据：同一个 Tracking No. = 同一个包裹（一次邮费）= 一页。
+
+    Lark 里同一个包裹常因款式/尺码不同被拆成多条记录（每条都带完整地址），
+    这些记录的 Tracking 相同，必须并到同一页，否则仓库会当成几个包裹分开打。
+    Tracking 为空时无法判断是否同包裹，退回按订单（order_key）分页，
+    避免多个"暂无 Tracking"的不同订单被误合并。
+    """
+    groups = OrderedDict()
+    for row in rows:
+        key = ("tracking", row["tracking"]) if row["tracking"] else ("order", row["order_key"])
+        groups.setdefault(key, []).append(row)
+    return groups
+
+
+def _recipient_key(row: dict) -> str:
+    return re.sub(r"\s+", " ", f'{row["name"]} {row["address"]}').strip().casefold()
+
+
+def distinct_recipients(items: list) -> list:
+    """一个包裹内出现过的不同收件人 [(name, address)]，按出现顺序去重。"""
+    seen = OrderedDict()
+    for item in items:
+        seen.setdefault(_recipient_key(item), (item["name"], item["address"]))
+    return list(seen.values())
+
+
 def make_shipping_pdf(rows: list) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter,
@@ -1194,16 +1295,34 @@ def make_shipping_pdf(rows: list) -> bytes:
         spaceAfter=3, textColor=colors.red, leftIndent=6,
     )
 
-    # Group rows preserving insertion order。按 order_key（订单）分组，
-    # 而不是按 tracking 值分组——避免多个"暂无 Tracking"的不同订单被误合并到同一页
-    groups = OrderedDict()
-    for row in rows:
-        groups.setdefault(row["order_key"], []).append(row)
+    # Group rows preserving insertion order：一个 Tracking No. 一张发货单
+    groups = group_rows_by_package(rows)
+
+    # 款式太多一页写不下时，表格会自动续到下一页（仍是同一张发货单）。
+    # 续页顶部补印 Tracking No. + 收件人，打印后散开也知道这页属于哪个包裹
+    current = {"label": "", "page": 0}
+
+    def _after_flowable(flowable):
+        label = getattr(flowable, "_package_label", None)
+        if label:
+            current["label"], current["page"] = label, doc.page
+
+    def _after_page():
+        if current["label"] and current["page"] != doc.page:
+            c = doc.canv
+            c.saveState()
+            c.setFont(CJK, 12)
+            c.setFillColor(colors.red)
+            c.drawString(doc.leftMargin, letter[1] - 0.45*inch, f"（续页）{current['label']}")
+            c.restoreState()
+
+    doc.afterFlowable = _after_flowable
+    doc.afterPage = _after_page
 
     story = []
     first_page = True
 
-    for order_key, items in groups.items():
+    for _, items in groups.items():
         if not first_page:
             story.append(PageBreak())
         first_page = False
@@ -1213,17 +1332,24 @@ def make_shipping_pdf(rows: list) -> bytes:
         tracking_display = tracking if tracking else "暂无 Tracking No.（请先完成打包）"
 
         # ── Tracking number (yellow highlight) ──
-        story.append(Paragraph(f"Tracking No.: {tracking_display}", tracking_style))
+        head = Paragraph(f"Tracking No.: {tracking_display}", tracking_style)
+        head._package_label = f"Tracking No.: {tracking_display} ｜ {items[0]['name']}"
+        story.append(head)
         story.append(Spacer(1, 0.12*inch))
 
         # ── Recipient name (pink highlight) + address ──
-        name    = items[0]["name"]
-        address = items[0]["address"]
-
-        story.append(Paragraph(name, name_style))
-        for line in address.split("\n"):
-            if line.strip():
-                story.append(Paragraph(line.strip(), addr_style))
+        # 正常情况一个 Tracking 只有一个收件人；若同一个号挂在了不同收件人上
+        #（多半是 Lark 里 Tracking 贴错行），全部列出来并标红，不能只印第一个把另一个藏掉
+        recipients = distinct_recipients(items)
+        if len(recipients) > 1:
+            story.append(Paragraph(
+                f"注意：这个 Tracking No. 下有 {len(recipients)} 个不同的收件人/地址，请先核对再打包",
+                note_style))
+        for name, address in recipients:
+            story.append(Paragraph(name, name_style))
+            for line in address.split("\n"):
+                if line.strip():
+                    story.append(Paragraph(line.strip(), addr_style))
         story.append(Spacer(1, 0.2*inch))
 
         # ── Product table (aggregate qty) ──
@@ -1305,6 +1431,25 @@ def show_section(label: str, rows: list, key_prefix: str, date_prefix: str):
 
     st.divider()
     st.subheader(f"{label} — 发货单")
+    packages = group_rows_by_package(rows)
+    merged_lines, conflict_lines = [], []
+    for (kind, key), items in packages.items():
+        if kind != "tracking":
+            continue
+        n_records = len({i["order_key"] for i in items})
+        if n_records > 1:
+            merged_lines.append(f"- {key}（{items[0]['name']}）：{n_records} 条记录、共 {len(items)} 件，合并成一页")
+        recipients = distinct_recipients(items)
+        if len(recipients) > 1:
+            conflict_lines.append(f"- {key}：" + " / ".join(n for n, _ in recipients))
+    st.caption(f"共 {len(packages)} 页 —— 同一个 Tracking No. 的所有款式合在同一页。")
+    if merged_lines:
+        st.info("以下 Tracking No. 在表里分成了多条记录，已合并：\n" + "\n".join(merged_lines))
+    if conflict_lines:
+        st.error(
+            "同一个 Tracking No. 挂在了不同的收件人/地址上，多半是 Lark 里 Tracking 贴错了行。"
+            "发货单里这一页已标红并列出全部收件人，请先回表核对：\n" + "\n".join(conflict_lines)
+        )
     pdf_bytes = make_shipping_pdf(rows)
     st.download_button(
         f"⬇ 下载{label}发货单 PDF",
@@ -1313,6 +1458,42 @@ def show_section(label: str, rows: list, key_prefix: str, date_prefix: str):
         "application/pdf",
         key=f"{key_prefix}_ship",
     )
+
+
+def drop_duplicate_export_rows(df: pd.DataFrame) -> tuple:
+    """去掉与前面某行"整行每一列都相同"的记录，返回 (去重后的 df, 被去掉的行)。
+
+    Lark 的子记录导出 CSV 时会被导两遍（一遍跟在父记录下面，一遍在它自己的排序位置），
+    CSV 行数会比视图里的记录数多。不去掉的话拣货单会多拣一份、发货单会多出一页一模一样的。
+    """
+    dup = df.duplicated(keep="first")
+    return df[~dup].copy(), df[dup].copy()
+
+
+def _dup_row_label(r) -> str:
+    who = _clean_str(r.get("达人Name")) or split_shipping_info(_clean_str(r.get("Shipping Info")))[0]
+    what = _clean_str(r.get("Product Name")) or _clean_str(r.get("款式 + 库位")) or _clean_str(r.get("库位"))
+    size = _clean_str(r.get("Size'")) or _clean_str(r.get("Size"))
+    trk = _clean_str(r.get("打包 Tracking No."))
+    return "｜".join(x for x in [who, what, size, f"Tracking {trk}" if trk else ""] if x)
+
+
+def dedup_with_notice(df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
+    kept, dropped = drop_duplicate_export_rows(df)
+    if dropped.empty:
+        return df
+    detail = "\n".join(f"- {_dup_row_label(r)}" for _, r in dropped.iterrows())
+    if not enabled:
+        st.warning(
+            f"这份 CSV 里有 {len(dropped)} 行和前面某一行完全一样，你已取消自动去重，"
+            "它们会照常计入拣货单/发货单（数量会多算一份）：\n" + detail
+        )
+        return df
+    st.warning(
+        f"这份 CSV 里有 {len(dropped)} 行和前面某一行完全一样（Lark 子记录导出时会被导两遍），"
+        "已自动去掉、不重复计入拣货单/发货单：\n" + detail
+    )
+    return kept
 
 
 # 长数字列必须按文本读取，否则 pandas 会推断成 float64，
@@ -1375,7 +1556,10 @@ with tab1:
                 format_func=lambda x: f"{x} {'⬅️ 最新' if x == all_dates_1[0] else ''}",
                 key="d1",
             )
-            orders_1 = filter_orders_for_date(df1, sel_date_1)
+            # 先去掉 Lark 子记录导出造成的整行重复，合并提示里的记录数才和 Lark 里看到的一致
+            records_1, _ = drop_duplicate_export_rows(filter_orders_for_date(df1, sel_date_1))
+            orders_1, merged_1 = merge_orders_by_recipient(records_1)
+            show_merge_notice(merged_1, len(records_1), len(orders_1))
             split_1 = split_orders_by_type(orders_1)
             kol_orders = split_1["kol"]
             customer_orders = split_1["customer"]
@@ -1574,7 +1758,11 @@ with tab1:
                 key="d_kol",
             )
             orders_kol_all = filter_orders_for_date(df_kol, sel_date_kol)
-            orders_kol = orders_kol_all[orders_kol_all.apply(is_kol_order, axis=1)]
+            records_kol, _ = drop_duplicate_export_rows(
+                orders_kol_all[orders_kol_all.apply(is_kol_order, axis=1)]
+            )
+            orders_kol, merged_kol = merge_orders_by_recipient(records_kol)
+            show_merge_notice(merged_kol, len(records_kol), len(orders_kol))
 
             st.metric("当日深达单", len(orders_kol))
 
@@ -1620,7 +1808,7 @@ with tab2:
     st.subheader("第 2 步 · 拣货单 & 发货单生成器")
     st.caption(
         "上传当日的 客人水单 CSV / 深度达人单 CSV（可只传其一）→ "
-        "下载拣货单 CSV（按库位汇总）+ 发货单 PDF（按 Tracking No. 一单一页）"
+        "下载拣货单 CSV（按库位汇总）+ 发货单 PDF（一个 Tracking No. 一页，该号下所有款式都在这一页）"
     )
 
     if not REPORTLAB_OK:
@@ -1648,14 +1836,22 @@ with tab2:
     )
     include_no_location = no_loc_choice.startswith("✅")
 
+    dedup_rows = st.checkbox(
+        "自动去掉整行完全重复的记录（Lark 子记录导出 CSV 时会被导两遍）",
+        value=True,
+        key="dedup_rows",
+        help="只有确实要给同一个人发两份同款同码、并且在 Lark 里录成了两条一模一样的记录时，才取消勾选。",
+    )
+
     st.divider()
 
     if customer_file:
         df_c = read_file(customer_file)
         warn_if_corrupted_tracking(df_c)
+        st.markdown("## 客人水单")
+        df_c = dedup_with_notice(df_c, dedup_rows)
         rows_c, skipped_c = parse_customer_rows(df_c, include_no_location)
         date_c = extract_date_prefix(df_c)
-        st.markdown("## 客人水单")
         if skipped_c:
             st.warning(
                 "以下商品无固定库位、已从拣货单/发货单中剔除，请人工核对是否需要打包：\n"
@@ -1667,9 +1863,10 @@ with tab2:
     if influencer_file:
         df_i = read_file(influencer_file)
         warn_if_corrupted_tracking(df_i)
+        st.markdown("## 深度达人单")
+        df_i = dedup_with_notice(df_i, dedup_rows)
         rows_i, skipped_i = parse_influencer_rows(df_i, include_no_location)
         date_i = extract_date_prefix(df_i)
-        st.markdown("## 深度达人单")
         if skipped_i:
             st.warning(
                 "以下商品无固定库位、已从拣货单/发货单中剔除，请人工核对是否需要打包：\n"
