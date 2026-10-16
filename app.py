@@ -227,7 +227,8 @@ def parse_free_address(text: str) -> dict:
     if not isinstance(text, str): return {}
     s = text.strip().rstrip(",").strip()
     s = s.replace("，", ",").replace("　", " ")
-    s = re.sub(r"\s*\n\s*", " ", s)
+    # 换行当逗号：分行写的地址，行与行就是街道/城市的分界（"1007 130TH ST SW\nEVERETT"）
+    s = re.sub(r"\s*,?\s*\n\s*", ", ", s)
     s = re.sub(r"\s+", " ", s)
 
     zip_matches = list(re.finditer(r"\b(\d{5})(-\d{4})?\b", s))
@@ -246,26 +247,31 @@ def parse_free_address(text: str) -> dict:
         we = min(len(s), ze + 10)
         window = s[ws:we]
         window_upper = window.upper()
-        for full, abbr in sorted(_STATE_FULL_TO_ABBR.items(), key=lambda x: -len(x[0])):
-            m = re.search(r"\b" + re.escape(full) + r"\b", window_upper)
-            if m:
-                state = abbr
-                state_pos = ws + m.start()
-                break
-        if not state:
-            for m in re.finditer(r"\b([A-Za-z]{2})\b\.?", window):
-                tok = m.group(1).upper()
-                if tok in _STATE_ABBR:
-                    state = tok
-                    state_pos = ws + m.start()
+        # 邮编前面可能不止一个"州"：街道名也会叫州名（"3554 W Ohio St Chicago, IL"），
+        # 城市也会（"Indiana, PA"）。真正的州紧挨在邮编前面，所以取离邮编最近的那个
+        cands = []  # (起点, 终点, 州缩写)
+        for full, abbr in _STATE_FULL_TO_ABBR.items():
+            for m in re.finditer(r"\b" + re.escape(full) + r"\b", window_upper):
+                cands.append((ws + m.start(), ws + m.end(), abbr))
+        for m in re.finditer(r"\b([A-Za-z]{2})\b", window):
+            tok = m.group(1).upper()
+            if tok in _STATE_ABBR:
+                cands.append((ws + m.start(), ws + m.end(), tok))
+        before_zip = [c for c in cands if c[1] <= zs]
+        if before_zip:
+            # 终点相同取更长的（West Virginia 而不是 Virginia）
+            state_pos, _, state = max(before_zip, key=lambda c: (c[1], -c[0]))
+        elif cands:
+            state_pos, _, state = min(cands)  # 州写在邮编后面（"60624 IL"）
     if not state and not zip_match:
+        # 没邮编时州在地址最后，取最靠后的州全称（"77 Texas St Dallas Texas" 认后一个）
         s_upper = s.upper()
-        for full, abbr in sorted(_STATE_FULL_TO_ABBR.items(), key=lambda x: -len(x[0])):
-            m = re.search(r"\b" + re.escape(full) + r"\b", s_upper)
-            if m:
-                state = abbr
-                state_pos = m.start()
-                break
+        cands = []
+        for full, abbr in _STATE_FULL_TO_ABBR.items():
+            for m in re.finditer(r"\b" + re.escape(full) + r"\b", s_upper):
+                cands.append((m.start(), m.end(), abbr))
+        if cands:
+            state_pos, _, state = max(cands, key=lambda c: (c[1], -c[0]))
 
     if state_pos is not None and zip_match is not None:
         cut = min(state_pos, zip_match.start())
